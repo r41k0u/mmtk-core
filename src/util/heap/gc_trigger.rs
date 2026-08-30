@@ -239,24 +239,23 @@ impl<VM: VMBinding> GCTrigger<VM> {
         use crate::util::options::NurserySize;
         debug_assert!(self.plan().generational().is_some());
         match *self.options.nursery {
-            NurserySize::Bounded { min: _, max } => {
-                let scaled = max.saturating_mul(self.nursery_scale.load(Ordering::Relaxed));
-                if self.policy.can_heap_size_grow() {
-                    // Growable (space-overhead/MemBalancer) heap: the trigger adds
-                    // headroom for the scaled budget (see SpaceOverheadTrigger::
-                    // on_gc_end), so the budget itself needs no clamp.
-                    scaled
-                } else {
-                    // Pinned heap (MMTK_HEAP_SIZE_MB): no headroom mechanism — a
-                    // budget that dwarfs the fixed heap would turn every GC into a
-                    // full-heap one via virtual_memory_exhausted(). Cap the SCALED
-                    // portion at a quarter of the heap; never go below the
-                    // unscaled budget (scale=1 behaviour is unchanged).
-                    let quarter_heap = conversions::pages_to_bytes(
-                        self.policy.get_current_heap_size_in_pages(),
-                    ) / 4;
-                    std::cmp::max(max, std::cmp::min(scaled, quarter_heap))
-                }
+            NurserySize::Bounded { min, max } => {
+                // A nursery budget that rivals the heap limit turns every GC into
+                // a full-heap one via virtual_memory_exhausted() and can livelock
+                // the allocation retry loop — the 16 MiB default nursery inside
+                // the 32 MiB dynamic-heap floor did exactly that (heap frozen at
+                // the floor, zero progress). Cap the budget at a quarter of the
+                // CURRENT heap unconditionally: under the growable triggers the
+                // cap relaxes as the heap grows, so a warmed-up heap still gets
+                // the full scaled budget. The scaled `min` stays the floor so the
+                // Bounded min..max contract (min <= max) holds at any heap size.
+                let scale = self.nursery_scale.load(Ordering::Relaxed);
+                let scaled = max.saturating_mul(scale);
+                let scaled_min = min.saturating_mul(scale);
+                let quarter_heap = conversions::pages_to_bytes(
+                    self.policy.get_current_heap_size_in_pages(),
+                ) / 4;
+                std::cmp::max(scaled_min, std::cmp::min(scaled, quarter_heap))
             }
             NurserySize::ProportionalBounded { min: _, max } => {
                 let heap_size_bytes =
@@ -270,8 +269,19 @@ impl<VM: VMBinding> GCTrigger<VM> {
                     max_bytes
                 }
             }
-            NurserySize::Fixed(sz) => sz,
+            NurserySize::Fixed(sz) => self.clamp_fixed_nursery(sz),
         }
+    }
+
+    // An explicit Fixed nursery gets the same quarter-heap guard as Bounded: a
+    // pin at or above half the heap degenerates every collection into an
+    // emergency full-heap GC (D5 grid finding: kb/binarytrees with Fixed
+    // nurseries >= heap/2 under the dynamic floor stormed or hung). Applied in
+    // BOTH getters so the Fixed min == max contract is preserved.
+    fn clamp_fixed_nursery(&self, sz: usize) -> usize {
+        let quarter_heap =
+            conversions::pages_to_bytes(self.policy.get_current_heap_size_in_pages()) / 4;
+        std::cmp::min(sz, std::cmp::max(quarter_heap, BYTES_IN_PAGE))
     }
 
     /// Return lower bound of the nursery size (in number of bytes)
@@ -295,7 +305,7 @@ impl<VM: VMBinding> GCTrigger<VM> {
                     min_bytes
                 }
             }
-            NurserySize::Fixed(sz) => sz,
+            NurserySize::Fixed(sz) => self.clamp_fixed_nursery(sz),
         }
     }
 
@@ -418,6 +428,17 @@ pub struct SpaceOverheadTrigger {
     /// Headroom factor: heap = live × (1 + overhead). (e.g. 1.0 => 2× live.)
     overhead: f64,
     current_heap_pages: AtomicUsize,
+    /// Peak reserved pages observed while the heap was over its limit, since
+    /// the last resize. At poll time `get_reserved_pages()` INCLUDES the
+    /// pending reservation of the allocation that forced the poll, but that
+    /// reservation is cleared from the page resource before the GC runs — so
+    /// `on_gc_end` computing the new limit from live pages alone can never
+    /// admit a single allocation larger than (limit - live). Without this
+    /// channel such a request livelocks: the GC frees nothing relevant, the
+    /// limit recomputes from live-only, the retry re-polls, forever (observed:
+    /// macro-bench decompress's first ~256 MB payload allocation against the
+    /// 32 MB floor sat at 2 MB RSS indefinitely).
+    pending_demand_pages: AtomicUsize,
 }
 impl SpaceOverheadTrigger {
     fn new(min_heap_pages: usize, max_heap_pages: usize, overhead: f64) -> Self {
@@ -426,6 +447,7 @@ impl SpaceOverheadTrigger {
             max_heap_pages,
             overhead,
             current_heap_pages: AtomicUsize::new(min_heap_pages),
+            pending_demand_pages: AtomicUsize::new(0),
         }
     }
 }
@@ -440,15 +462,19 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
     }
 
     fn on_gc_end(&self, mmtk: &'static MMTK<VM>) {
-        // Only resize after a FULL/major GC. A nursery GC's `get_reserved_pages()` is
-        // transiently inflated (un-released nursery + Immix block fragmentation), so
-        // resizing on it overshoots — badly, since smaller nurseries do more nursery
-        // GCs. Post-full-GC, reserved ≈ the live set.
-        if let Some(gen) = mmtk.get_plan().generational() {
-            if !gen.last_collection_full_heap() {
-                return;
-            }
-        }
+        // A nursery GC's `get_reserved_pages()` is transiently inflated (un-released
+        // nursery + Immix block fragmentation), so a nursery-GC resize may only GROW
+        // the limit, never shrink it — shrinking waits for a full GC, where
+        // reserved ≈ the live set. The grow half cannot wait for a full GC: with
+        // the limit frozen in between, a live set climbing past it keeps every
+        // poll reporting "heap full" while nursery GCs reclaim nothing, and the
+        // full GC that would lift the limit arrives as a storm (macro benches
+        // with monotonically growing multi-GB live sets sat at the 32 MiB floor
+        // making no progress).
+        let full_gc = match mmtk.get_plan().generational() {
+            Some(gen) => gen.last_collection_full_heap(),
+            None => true,
+        };
         // Size the heap to live × (1 + overhead), clamped to [min, max].
         let live = mmtk.get_plan().get_reserved_pages();
         // Per-domain nursery-scaling headroom (stock parity: stock's per-domain
@@ -474,12 +500,33 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
             0
         };
         let target = ((live as f64) * (1.0 + self.overhead)) as usize + nursery_headroom_pages;
+        // Admit the demand recorded at poll time (live-then + the pending
+        // request): size it with the same overhead factor so the retry both
+        // fits and has working room. In the normal regime demand ≈ live, so
+        // this is a no-op; it only bites when a request outsized the limit.
+        let demand = self.pending_demand_pages.swap(0, Ordering::Relaxed);
+        let demand_target = ((demand as f64) * (1.0 + self.overhead)) as usize;
+        let target = std::cmp::max(target, demand_target);
         let clamped = target.clamp(self.min_heap_pages, self.max_heap_pages);
-        self.current_heap_pages.store(clamped, Ordering::Relaxed);
+        if full_gc {
+            self.current_heap_pages.store(clamped, Ordering::Relaxed);
+        } else {
+            // Grow-only on nursery GCs (the inflated reserve can overshoot, but
+            // an overshot limit self-corrects at the next full GC; a frozen one
+            // livelocks).
+            self.current_heap_pages.fetch_max(clamped, Ordering::Relaxed);
+        }
     }
 
     fn is_heap_full(&self, plan: &dyn Plan<VM = VM>) -> bool {
-        plan.get_reserved_pages() > self.current_heap_pages.load(Ordering::Relaxed)
+        let reserved = plan.get_reserved_pages();
+        let full = reserved > self.current_heap_pages.load(Ordering::Relaxed);
+        if full {
+            // Reserved still includes the pending reservation here; remember it
+            // for the post-GC resize (see field doc).
+            self.pending_demand_pages.fetch_max(reserved, Ordering::Relaxed);
+        }
+        full
     }
 
     fn get_current_heap_size_in_pages(&self) -> usize {
