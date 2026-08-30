@@ -229,7 +229,10 @@ impl<VM: VMBinding> GenerationalPlan for GenImmix<VM> {
     }
 
     fn get_mature_reserved_pages(&self) -> usize {
-        self.immix_space.reserved_pages()
+        // Include the LOS: dead large objects are only swept at a full GC,
+        // so LOS churn invisible to the pressure law pools until the
+        // allocation-cadence backstop (see the Bactrian accessor).
+        self.immix_space.reserved_pages() + self.gen.common.get_los().reserved_pages()
     }
 
     fn force_full_heap_collection(&self) {
