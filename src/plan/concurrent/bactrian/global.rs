@@ -640,8 +640,15 @@ impl<VM: VMBinding> GenerationalPlan for Bactrian<VM> {
         // binding's pressure/cadence pacing, or a band-heavy workload
         // (fragmed) never triggers the majors whose sweeps feed its free
         // lists and runs to the space-full edge (203MB RSS, 1 GC).
+        // The LOS is mature for the same reason: dead large objects are
+        // only swept (and their pages only returned) at a full, so LOS
+        // churn that the pressure law cannot see accumulates until the
+        // allocation-cadence backstop — a large-int workload with a ~10MB
+        // live set peaked at 585MB, 532MB of it dead LOS pages pooled
+        // between backstop-paced fulls.
         self.immix_space.reserved_pages()
             + self.gen.common.get_nonmoving().reserved_pages()
+            + self.gen.common.get_los().reserved_pages()
     }
 
     fn force_full_heap_collection(&self) {

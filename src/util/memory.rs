@@ -302,6 +302,17 @@ pub fn munmap(start: Address, size: usize) -> Result<()> {
     wrap_libc_call(&|| unsafe { libc::munmap(start.to_mut_ptr(), size) }, 0)
 }
 
+/// Return the physical pages backing the range to the OS while keeping the
+/// mapping (madvise MADV_DONTNEED). The range refaults as zero pages on next
+/// touch. Page-granular; best-effort (an madvise failure only means the pages
+/// stay resident).
+#[cfg(target_os = "linux")]
+pub fn madvise_dontneed(start: Address, size: usize) {
+    unsafe {
+        libc::madvise(start.to_mut_ptr(), size, libc::MADV_DONTNEED);
+    }
+}
+
 /// Properly handle errors from a mmap Result, including invoking the binding code in the case of
 /// an OOM error.
 pub fn handle_mmap_error<VM: VMBinding>(

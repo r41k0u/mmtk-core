@@ -1,4 +1,14 @@
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// Return freed large-object pages to the OS (madvise DONTNEED) on release.
+/// Default ON; opt out with MMTK_RELEASE_LOS_PAGES=0. See release_pages.
+#[cfg(target_os = "linux")]
+pub fn release_los_pages() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MMTK_RELEASE_LOS_PAGES").map_or(true, |v| v != "0")
+    })
+}
 
 use super::layout::vm_layout::PAGES_IN_CHUNK;
 use super::layout::VMMap;
@@ -341,6 +351,26 @@ impl<VM: VMBinding> FreeListPageResource<VM> {
 
         if self.protect_memory_on_release.is_some() {
             self.mprotect(first, pages as _);
+        }
+
+        // Return the physical pages of LARGE frees to the OS. Without any
+        // return, freed large-object pages sit on the freelist mapped and
+        // dirty forever, so peak RSS tracks the LOS high-water mark rather
+        // than its live set. The threshold matters: a per-release madvise on
+        // a large-int-churn workload issued 328K madvise calls (3.3s of
+        // syscall time) to shave 18MB, while the >=2MiB threshold catches
+        // the objects that dominate RSS (frame pools, staging buffers) at
+        // one syscall each. Small-object churn stays warm on the freelist,
+        // and the LOS-aware mature-pressure law bounds its pool via
+        // ordinary fulls. Refault zero-fills; the LOS skips acquire-time
+        // zeroing when this is active (see CommonPlan). Opt out with
+        // MMTK_RELEASE_LOS_PAGES=0.
+        #[cfg(target_os = "linux")]
+        {
+            let bytes = (pages as usize) << crate::util::constants::LOG_BYTES_IN_PAGE;
+            if bytes >= (2 << 20) && release_los_pages() {
+                crate::util::memory::madvise_dontneed(first, bytes);
+            }
         }
 
         self.common.accounting.release(pages as _);
