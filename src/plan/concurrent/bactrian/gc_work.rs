@@ -231,7 +231,30 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
         // inside a quantum, which is after this quota is read.
         let inflow_mark = || ENQUEUED.load(Relaxed) + SATB_ENQ.load(Relaxed);
         let quota = self.budget.map(|_| {
-            inflow_mark().saturating_sub(self.plan.enqueued_at_last_quantum.load(Relaxed) as usize)
+            let inflow = inflow_mark().saturating_sub(self.plan.enqueued_at_last_quantum.load(Relaxed) as usize);
+            // Runway floor: besides its own inflow, each slice retires enough
+            // of the backlog for the cycle to finish before promotion consumes
+            // the runway latched at InitialMark — stock's "slice work
+            // proportional to what must be done before the heap is full".
+            // With no runway left, drain everything now.
+            let backlog = self.plan.mark_backlog_objects();
+            let (promo, runway) = self.plan.promotion_and_runway();
+            // Minors the runway allows; never fewer than the slices needed to
+            // keep each slice within the pause target at the measured mark
+            // rate. Past the runway the heap overshoots the frozen limit by
+            // promotion x the slices left — bounded — instead of one slice
+            // draining everything (sedlex: 16-38 s).
+            let avail_runway = if promo == 0 { u64::MAX } else { (runway / promo).max(1) };
+            let rate = self.plan.mark_rate_x256();
+            let min_slices = if rate == 0 {
+                1
+            } else {
+                let backlog_ms = backlog as f64 * 256.0 / rate as f64;
+                (backlog_ms / self.plan.slice_target_ms()).ceil().max(1.0) as u64
+            };
+            let avail = std::cmp::max(std::cmp::min(avail_runway, u64::MAX / 2), min_slices) as usize;
+            let share = if promo == 0 && rate == 0 { 0 } else { backlog.div_ceil(avail) };
+            inflow + share
         });
         let traced_at_start = TRACED.load(Relaxed);
         let started = std::time::Instant::now();
@@ -271,6 +294,11 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
         self.plan
             .enqueued_at_last_quantum
             .store(inflow_mark() as u64, Relaxed);
+        self.plan.note_mark_rate(
+            (TRACED.load(Relaxed) - traced_at_start) as u64,
+            started.elapsed().as_nanos() as u64,
+        );
+        self.plan.note_quantum_nanos(started.elapsed().as_nanos() as u64);
         if let Some(q) = quota {
             // Projection guard: at the measured net rate (objects of backlog
             // retired per slice, EWMA), does the backlog finish before
@@ -288,10 +316,12 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
             let drained = self.plan.marking_queue_drained();
             let need = if net_ewma == 0 { f64::INFINITY } else { backlog as f64 / net_ewma as f64 };
             let avail = if promo == 0 { f64::INFINITY } else { runway as f64 / promo as f64 };
+            // With the runway-paced, target-capped share above, the slices
+            // already finish the cycle inside the runway or overshoot it by a
+            // bounded amount; an unbudgeted drain here would just be the
+            // multi-second pause the cap exists to avoid (v6e eio: 14
+            // escalations = 11 pauses > 500 ms). Report, don't escalate.
             let escalate = !drained && slices >= 4 && need > avail;
-            if escalate {
-                self.plan.request_escalate_mark();
-            }
             if std::env::var_os("MMTK_PACE_DEBUG").is_some() {
                 eprintln!(
                     "[pace] quantum: budget={:.1}ms quota={} traced={} packets={} took={:.1}ms drained={} | guard: backlog={} net={}/slice promo={}p runway={}MB need={:.0} avail={:.0} slices={}{}",
@@ -361,6 +391,25 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
         // Sample this pause's promotion BEFORE sweeping (the sweep frees
         // mature pages, which would hide it) — see sample_promotion.
         let promo_runway = self.budget.map(|_| self.plan.sample_promotion());
+        // Runway floor for the sweep: a pending cycle request waits on this
+        // drain, so each slice sweeps at least its share of the remaining
+        // chunks for the drain to finish before promotion consumes the frozen
+        // runway; with no runway left, drain everything now. (A 2 ms slice
+        // was tuned at 192 MB; at 8-15 GB it took 146-432 minors.)
+        let sweep_quota = promo_runway.map(|(promo, runway)| {
+            let remaining = self.plan.sweep_packets_remaining();
+            if promo == 0 {
+                0
+            } else {
+                remaining.div_ceil((runway / promo).max(1) as usize)
+            }
+        });
+        // Soft time cap on the share (MMTK_SWEEP_SLICE_CAP_MS, default 20):
+        // past the runway the next cycle waits a little longer rather than
+        // one slice sweeping gigabytes.
+        let cap = std::time::Duration::from_secs_f64(
+            std::env::var("MMTK_SWEEP_SLICE_CAP_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(20.0) / 1e3,
+        );
         let started = std::time::Instant::now();
         let mut packets = 0usize;
         loop {
@@ -375,7 +424,8 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
             w.do_work(worker, mmtk);
             packets += 1;
             if let Some(d) = deadline {
-                if std::time::Instant::now() >= d {
+                let now = std::time::Instant::now();
+                if now >= d && (packets >= sweep_quota.unwrap_or(0) || now >= started + cap) {
                     // Budget expired. If the queue emptied on this very
                     // packet, still flip the flag in THIS pause — a one-pause
                     // delay would hold the sweep gate (no new cycle or Full)
@@ -399,6 +449,7 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
                 }
             }
         }
+        self.plan.note_quantum_nanos(started.elapsed().as_nanos() as u64);
         if let Some((promo, runway)) = promo_runway {
             // Projection guard for the sweep: a pending cycle request waits on
             // this drain, so at the measured packets-per-slice rate the

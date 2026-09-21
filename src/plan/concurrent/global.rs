@@ -76,6 +76,25 @@ pub trait ConcurrentPlan: Plan {
         true
     }
 
+    /// Bytes marked by the most recently COMPLETED sliced/concurrent marking
+    /// cycle (its live set at the snapshot), or 0 when the last whole-heap
+    /// collection was a STW Full (whose swept reserved pages are already an
+    /// honest live size) or the plan does not track it. Heap sizing and the
+    /// binding's cycle-start baseline use this instead of reserved pages
+    /// after a FinalMark, where reserved still contains the unswept garbage
+    /// and everything promoted (born black) during the cycle.
+    fn last_cycle_marked_bytes(&self) -> usize {
+        0
+    }
+
+    /// Heap limit (pages) latched when the in-flight or most recent sliced
+    /// cycle started; the runway the cycle's quanta are paced against. The
+    /// live limit may be nudged up during the cycle so allocation never
+    /// fails, but the pacing budget stays frozen. 0 = none.
+    fn cycle_start_heap_pages(&self) -> usize {
+        0
+    }
+
     /// Request a pause to PROGRESS in-flight incremental work (marking or
     /// sweep quanta) even though no nursery trigger fired — the analog of
     /// stock OCaml running a major slice off major-heap allocation. Called by
