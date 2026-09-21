@@ -202,6 +202,8 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
             if nodes.is_empty() {
                 return;
             }
+            crate::plan::concurrent::diag::SATB_RUN
+                .fetch_add(nodes.len(), std::sync::atomic::Ordering::Relaxed);
 
             ConcurrentTraceObjects::<VM, P, KIND>::new(nodes, mmtk)
         } else {
