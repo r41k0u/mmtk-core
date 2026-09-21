@@ -428,6 +428,9 @@ pub struct SpaceOverheadTrigger {
     /// Headroom factor: heap = live × (1 + overhead). (e.g. 1.0 => 2× live.)
     overhead: f64,
     current_heap_pages: AtomicUsize,
+    /// A sliced cycle's FinalMark ran with its sweep deferred: resize from the
+    /// cycle's marked bytes at the first GC end whose sweep has drained.
+    resize_after_sweep: AtomicBool,
     /// Peak reserved pages observed while the heap was over its limit, since
     /// the last resize. At poll time `get_reserved_pages()` INCLUDES the
     /// pending reservation of the allocation that forced the poll, but that
@@ -448,6 +451,7 @@ impl SpaceOverheadTrigger {
             overhead,
             current_heap_pages: AtomicUsize::new(min_heap_pages),
             pending_demand_pages: AtomicUsize::new(0),
+            resize_after_sweep: AtomicBool::new(false),
         }
     }
 }
@@ -508,12 +512,67 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
         let demand_target = ((demand as f64) * (1.0 + self.overhead)) as usize;
         let target = std::cmp::max(target, demand_target);
         let clamped = target.clamp(self.min_heap_pages, self.max_heap_pages);
-        if full_gc {
+        if let Some(c) = mmtk.get_plan().concurrent() {
+            // Plans with sliced/concurrent major cycles. "reserved pages after
+            // the pause" is NOT a live size while a cycle is in flight or its
+            // sweep is deferred: it holds the unswept garbage and everything
+            // promoted (born black) during the cycle, and it only grows between
+            // slices. Sizing from it after every minor let the limit chase the
+            // heap 1:1 (heap = 2.2 x reserved at every pause), so no cycle ever
+            // felt pressure and the excursion compounded (eio_conc: 1 GB live,
+            // 13-24 GB RSS). Rules here:
+            //  - STW Full (marked == 0): swept live -> size from reserved, as
+            //    before.
+            //  - FinalMark of a sliced cycle: defer until its sweep drains, then
+            //    size from the cycle's MARKED bytes, but never below what is
+            //    still reserved plus the nursery headroom (the black-born pile
+            //    is admitted once; the next cycle tests it and the limit comes
+            //    back down).
+            //  - Any other GC: the limit is only nudged up to keep allocation
+            //    from failing (reserved + headroom), never multiplied. Pacing
+            //    uses the limit frozen at the cycle's start (see
+            //    ConcurrentPlan::cycle_start_heap_pages), so the nudge does not
+            //    become runway.
+            let marked = c.last_cycle_marked_bytes();
+            let sweep_pending = !c.sweep_drained();
+            let is_final_mark = full_gc && marked > 0;
+            // Headroom above what is reserved: the runway the next (or the
+            // in-flight) sliced cycle gets. Two nurseries of copy reserve at
+            // least (nursery_headroom_pages is only the per-domain EXTRA over
+            // the bounded max, zero at defaults — a floor of reserved alone
+            // made the heap "full" on the next allocation and every cycle
+            // degraded to a Full), or half the overhead of the marked live
+            // set once a sliced cycle has measured it.
+            let marked_pages = conversions::bytes_to_pages_up(marked);
+            let nursery_pages = conversions::bytes_to_pages_up(mmtk.gc_trigger.get_max_nursery_bytes());
+            let headroom = std::cmp::max(
+                nursery_headroom_pages + 2 * nursery_pages,
+                ((marked_pages as f64) * self.overhead * 0.5) as usize,
+            );
+            let floor = (live + headroom).clamp(self.min_heap_pages, self.max_heap_pages);
+            if full_gc && !is_final_mark {
+                self.current_heap_pages.store(clamped, Ordering::Relaxed);
+                self.resize_after_sweep.store(false, Ordering::Relaxed);
+            } else if is_final_mark && sweep_pending {
+                self.resize_after_sweep.store(true, Ordering::Relaxed);
+                self.current_heap_pages.fetch_max(floor, Ordering::Relaxed);
+            } else if (is_final_mark || self.resize_after_sweep.load(Ordering::Relaxed)) && !sweep_pending {
+                let from_marked = ((marked_pages as f64) * (1.0 + self.overhead)) as usize + nursery_headroom_pages;
+                let t = std::cmp::max(from_marked, floor).clamp(self.min_heap_pages, self.max_heap_pages);
+                self.current_heap_pages.store(t, Ordering::Relaxed);
+                self.resize_after_sweep.store(false, Ordering::Relaxed);
+            } else {
+                self.current_heap_pages.fetch_max(floor, Ordering::Relaxed);
+            }
+            if demand > 0 {
+                self.current_heap_pages.fetch_max(
+                    demand_target.clamp(self.min_heap_pages, self.max_heap_pages),
+                    Ordering::Relaxed,
+                );
+            }
+        } else if full_gc {
             self.current_heap_pages.store(clamped, Ordering::Relaxed);
         } else {
-            // Grow-only on nursery GCs (the inflated reserve can overshoot, but
-            // an overshot limit self-corrects at the next full GC; a frozen one
-            // livelocks).
             self.current_heap_pages.fetch_max(clamped, Ordering::Relaxed);
         }
     }

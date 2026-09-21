@@ -133,6 +133,25 @@ pub struct Bactrian<VM: VMBinding> {
     nursery_pause_ewma_nanos: AtomicU64,
     /// now_nanos() at the current pause's prepare(), for the EWMA above.
     pause_start_nanos: AtomicU64,
+    /// EWMA (alpha 1/4) of monolithic Full pause wall time in nanoseconds.
+    /// The slicing gate's "worth" test uses it beside the live/mark-rate
+    /// estimate: that estimate is live-only at an assumed rate, while a Full
+    /// also sweeps everything reserved and pays fixed per-pause work (eio:
+    /// estimate 80-180 ms, measured Fulls 0.4-1.8 s). 0 = no Full yet.
+    full_pause_ewma_nanos: AtomicU64,
+    /// Nanoseconds spent in mark/sweep quanta during the current pause; the
+    /// nursery-pause EWMA is taken NET of it, otherwise runway-sized slices
+    /// inflate the very average the slicing gate and the latency start use
+    /// to decide whether slicing fits (v6d: EWMA > 100 ms -> 44 Fulls).
+    quanta_nanos_this_pause: AtomicU64,
+    /// EWMA (alpha 1/4, x256 fixed point) of objects traced per millisecond
+    /// inside mark quanta: the measured mark rate, for sizing slices and for
+    /// the latency-aware cycle start. 0 = no sample yet.
+    mark_rate_objs_per_ms_x256: AtomicU64,
+    /// Objects traced by the most recently completed sliced cycle (its live
+    /// object count), for predicting the next cycle's marking time.
+    last_cycle_traced_objs: AtomicU64,
+    traced_at_cycle_start: AtomicU64,
     /// Inflow mark (diag::ENQUEUED + diag::SATB_ENQ) when the previous mark
     /// quantum finished (or when InitialMark ended). Everything since then —
     /// SATB old values the barrier recorded between pauses (counted at
@@ -168,6 +187,13 @@ pub struct Bactrian<VM: VMBinding> {
     /// work would not finish before promotion consumed the runway.
     escalate_mark: AtomicBool,
     escalate_sweep: AtomicBool,
+    /// diag::MARKED_BYTES at InitialMark; the cycle's marked live size is the
+    /// delta at FinalMark (see ConcurrentPlan::last_cycle_marked_bytes).
+    marked_bytes_at_cycle_start: AtomicU64,
+    last_cycle_marked_bytes: AtomicU64,
+    /// Heap limit (pages) when the current/most recent sliced cycle started —
+    /// the frozen pacing runway (ConcurrentPlan::cycle_start_heap_pages).
+    cycle_start_heap_pages: AtomicU64,
     /// Pending mature-compaction request (ConcurrentPlan::
     /// request_mature_compaction — the binding's reserved-vs-live runaway
     /// law). Consumed by decide_pause: rides the next major as a COMPACT-ALL
@@ -379,6 +405,7 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
     fn prepare(&mut self, tls: VMWorkerThread) {
         let pause = self.current_pause().unwrap();
         self.pause_start_nanos.store(now_nanos(), Ordering::Relaxed);
+        self.quanta_nanos_this_pause.store(0, Ordering::Relaxed);
         self.mature_at_prepare
             .store(self.get_mature_reserved_pages() as u64, Ordering::Relaxed);
         match pause {
@@ -549,13 +576,20 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
 
     fn end_of_gc(&mut self, tls: VMWorkerThread) {
         let pause = self.current_pause().unwrap();
-        if matches!(pause, Pause::Nursery) {
+        if matches!(pause, Pause::Nursery | Pause::Full) {
             let start = self.pause_start_nanos.load(Ordering::Relaxed);
             if start != 0 {
-                let dur = now_nanos().saturating_sub(start);
-                let prev = self.nursery_pause_ewma_nanos.load(Ordering::Relaxed);
+                let dur = now_nanos()
+                    .saturating_sub(start)
+                    .saturating_sub(self.quanta_nanos_this_pause.load(Ordering::Relaxed));
+                let slot = if matches!(pause, Pause::Nursery) {
+                    &self.nursery_pause_ewma_nanos
+                } else {
+                    &self.full_pause_ewma_nanos
+                };
+                let prev = slot.load(Ordering::Relaxed);
                 let next = if prev == 0 { dur } else { prev - prev / 4 + dur / 4 };
-                self.nursery_pause_ewma_nanos.store(next, Ordering::Relaxed);
+                slot.store(next, Ordering::Relaxed);
             }
         }
 
@@ -577,6 +611,18 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                         as u64,
                     Ordering::Relaxed,
                 );
+                self.marked_bytes_at_cycle_start.store(
+                    crate::plan::concurrent::diag::MARKED_BYTES.load(Ordering::Relaxed) as u64,
+                    Ordering::Relaxed,
+                );
+                self.traced_at_cycle_start.store(
+                    crate::plan::concurrent::diag::TRACED.load(Ordering::Relaxed) as u64,
+                    Ordering::Relaxed,
+                );
+                self.cycle_start_heap_pages.store(
+                    self.gen.common.base.gc_trigger.policy.get_current_heap_size_in_pages() as u64,
+                    Ordering::Relaxed,
+                );
                 self.mark_net_ewma.store(0, Ordering::Relaxed);
                 self.mark_slices_this_cycle.store(0, Ordering::Relaxed);
                 self.satb_drift_at_cycle_start.store(
@@ -590,6 +636,12 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
             }
             Pause::FinalMark => {
                 self.sweep_packets_ewma_x256.store(0, Ordering::Relaxed);
+                let marked = (crate::plan::concurrent::diag::MARKED_BYTES.load(Ordering::Relaxed) as u64)
+                    .saturating_sub(self.marked_bytes_at_cycle_start.load(Ordering::Relaxed));
+                self.last_cycle_marked_bytes.store(marked.max(1), Ordering::Relaxed);
+                let traced = (crate::plan::concurrent::diag::TRACED.load(Ordering::Relaxed) as u64)
+                    .saturating_sub(self.traced_at_cycle_start.load(Ordering::Relaxed));
+                self.last_cycle_traced_objs.store(traced, Ordering::Relaxed);
                 self.sweep_slices_this_cycle.store(0, Ordering::Relaxed);
                 // End the MARKING half of the cycle, but under INCREMENTAL
                 // SWEEP keep allocate-as-live armed until the deferred sweep
@@ -612,7 +664,55 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                     });
                 }
             }
-            Pause::Full | Pause::Nursery => (),
+            Pause::Full => {
+                // A STW Full sweeps in-pause: reserved pages after it ARE the
+                // live size, so the marked-bytes channel is switched off.
+                self.last_cycle_marked_bytes.store(0, Ordering::Relaxed);
+                self.cycle_start_heap_pages.store(0, Ordering::Relaxed);
+            }
+            Pause::Nursery => {
+                // Latency-aware cycle start. With honest heap sizing the
+                // runway is ~1.2 x live; a large live set at Bactrian's mark
+                // rate cannot be marked within it at small slices if the
+                // cycle starts only at the margin law's 0.8 x limit (sedlex
+                // 6M: 8 GB live, 4.8 MB promoted per minor -> the runway floor
+                // degenerated into 16-38 s drain-all slices). Start as soon as
+                // the predicted marking time, spread over the minors left
+                // before the heap fills, exceeds the per-slice target.
+                if !self.concurrent_marking_in_progress()
+                    && !self.sweep_pending.load(Ordering::SeqCst)
+                    && !self.major_request_pending()
+                {
+                    let objs = self.last_cycle_traced_objs.load(Ordering::Relaxed);
+                    let rate = self.mark_rate_objs_per_ms_x256.load(Ordering::Relaxed);
+                    if objs > 0 && rate > 0 {
+                        let mark_ms = objs as f64 * 256.0 / rate as f64;
+                        let promo = self.promotion_ewma_pages.load(Ordering::Relaxed);
+                        let runway = self
+                            .gen
+                            .common
+                            .base
+                            .gc_trigger
+                            .policy
+                            .get_current_heap_size_in_pages()
+                            .saturating_sub(self.get_mature_reserved_pages()) as u64;
+                        let fill_minors = if promo == 0 { u64::MAX } else { (runway / promo).max(1) };
+                        let minor_ms =
+                            self.nursery_pause_ewma_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+                        let target = (slice_max_pause_ms() - minor_ms).max(25.0);
+                        let per_slice = if fill_minors == u64::MAX { 0.0 } else { mark_ms / fill_minors as f64 };
+                        if per_slice > target {
+                            if std::env::var_os("MMTK_PACE_DEBUG").is_some() {
+                                eprintln!(
+                                    "[pace] latency start: mark_ms={:.0} fill_minors={} per_slice={:.0}ms > target={:.0}ms -> request cycle",
+                                    mark_ms, fill_minors, per_slice, target
+                                );
+                            }
+                            self.gen.force_full_heap_collection();
+                        }
+                    }
+                }
+            }
         }
 
         self.previous_pause.store(Some(pause), Ordering::SeqCst);
@@ -855,6 +955,14 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
         !self.sweep_pending.load(Ordering::SeqCst)
     }
 
+    fn last_cycle_marked_bytes(&self) -> usize {
+        self.last_cycle_marked_bytes.load(Ordering::Relaxed) as usize
+    }
+
+    fn cycle_start_heap_pages(&self) -> usize {
+        self.cycle_start_heap_pages.load(Ordering::Relaxed) as usize
+    }
+
     fn request_mature_compaction(&self) {
         self.compact_requested.store(true, Ordering::SeqCst);
     }
@@ -973,13 +1081,17 @@ impl<VM: VMBinding> Bactrian<VM> {
     /// Pages between the trigger's current heap size and mature: what
     /// promotion can consume before the heap is full.
     pub(super) fn runway_pages(&self) -> usize {
-        self.gen
-            .common
-            .base
-            .gc_trigger
-            .policy
-            .get_current_heap_size_in_pages()
-            .saturating_sub(self.get_mature_reserved_pages())
+        // Pace against the limit latched at the cycle's InitialMark, not the
+        // live limit: the trigger may nudge the live limit up during a cycle
+        // (so allocation never fails), and pacing against that would let the
+        // budget chase the heap — the H1 ratchet.
+        let frozen = self.cycle_start_heap_pages.load(Ordering::Relaxed) as usize;
+        let limit = if frozen > 0 {
+            frozen
+        } else {
+            self.gen.common.base.gc_trigger.policy.get_current_heap_size_in_pages()
+        };
+        limit.saturating_sub(self.get_mature_reserved_pages())
     }
 
     /// Objects still to trace in this cycle: parked-but-unexecuted marking
@@ -1007,6 +1119,41 @@ impl<VM: VMBinding> Bactrian<VM> {
         let next = if prev == 0 { promoted } else { prev - prev / 4 + promoted / 4 };
         self.promotion_ewma_pages.store(next, Ordering::Relaxed);
         (next, self.runway_pages() as u64)
+    }
+
+    /// Current promotion EWMA and frozen runway without sampling (for quota
+    /// sizing at the start of a quantum; sample_promotion() folds this
+    /// pause's promotion in afterwards).
+    pub(super) fn promotion_and_runway(&self) -> (u64, u64) {
+        (self.promotion_ewma_pages.load(Ordering::Relaxed), self.runway_pages() as u64)
+    }
+
+    /// Fold a quantum's measured throughput (objects traced over its wall
+    /// time) into the mark-rate EWMA; returns the current rate x256.
+    pub(super) fn note_mark_rate(&self, traced: u64, nanos: u64) -> u64 {
+        if nanos < 200_000 || traced == 0 {
+            return self.mark_rate_objs_per_ms_x256.load(Ordering::Relaxed);
+        }
+        let sample = traced * 256 * 1_000_000 / nanos;
+        let prev = self.mark_rate_objs_per_ms_x256.load(Ordering::Relaxed);
+        let next = if prev == 0 { sample } else { prev - prev / 4 + sample / 4 };
+        self.mark_rate_objs_per_ms_x256.store(next, Ordering::Relaxed);
+        next
+    }
+
+    /// Per-slice mark target in ms: the pause budget minus the recent nursery
+    /// pause, floor 10 ms.
+    pub(super) fn slice_target_ms(&self) -> f64 {
+        let minor_ms = self.nursery_pause_ewma_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        (slice_max_pause_ms() - minor_ms).max(25.0)
+    }
+
+    pub(super) fn note_quantum_nanos(&self, nanos: u64) {
+        self.quanta_nanos_this_pause.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    pub(super) fn mark_rate_x256(&self) -> u64 {
+        self.mark_rate_objs_per_ms_x256.load(Ordering::Relaxed)
     }
 
     pub(super) fn note_mark_slice(&self, net: u64) -> (u64, u64) {
@@ -1149,6 +1296,11 @@ impl<VM: VMBinding> Bactrian<VM> {
             mark_debt_nanos: AtomicU64::new(0),
             nursery_pause_ewma_nanos: AtomicU64::new(0),
             pause_start_nanos: AtomicU64::new(0),
+            full_pause_ewma_nanos: AtomicU64::new(0),
+            quanta_nanos_this_pause: AtomicU64::new(0),
+            mark_rate_objs_per_ms_x256: AtomicU64::new(0),
+            last_cycle_traced_objs: AtomicU64::new(0),
+            traced_at_cycle_start: AtomicU64::new(0),
             enqueued_at_last_quantum: AtomicU64::new(0),
             mature_at_prepare: AtomicU64::new(0),
             promotion_ewma_pages: AtomicU64::new(0),
@@ -1159,6 +1311,9 @@ impl<VM: VMBinding> Bactrian<VM> {
             sweep_slices_this_cycle: AtomicU64::new(0),
             escalate_mark: AtomicBool::new(false),
             escalate_sweep: AtomicBool::new(false),
+            marked_bytes_at_cycle_start: AtomicU64::new(0),
+            last_cycle_marked_bytes: AtomicU64::new(0),
+            cycle_start_heap_pages: AtomicU64::new(0),
             compact_requested: AtomicBool::new(false),
             previous_pause: Atomic::new(None),
             concurrent_marking_active: AtomicBool::new(false),
@@ -1254,14 +1409,29 @@ impl<VM: VMBinding> Bactrian<VM> {
                         self.mark_quantum_hint_nanos.load(Ordering::Relaxed) as f64 / 1e6;
                     let minor_ms =
                         self.nursery_pause_ewma_nanos.load(Ordering::Relaxed) as f64 / 1e6;
-                    let worth = debt_ms > slice_worth_ms();
-                    let feasible = minor_ms + quantum_ms <= slice_max_pause_ms();
+                    let full_ms =
+                        self.full_pause_ewma_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+                    // Worth slicing if EITHER the estimate or the measured
+                    // Full duration exceeds the bar.
+                    let worth = debt_ms > slice_worth_ms() || full_ms > slice_worth_ms();
+                    // With runway-paced, target-capped slices the sliced pause is
+                    // bounded by construction; what slicing costs when the runway
+                    // is short is bounded heap overshoot, not pause time, while a
+                    // monolithic Full of a large live set costs seconds (ydump:
+                    // 14.5 s). The binding's quantum hint (debt over the live
+                    // limit's runway) is only informational now. Slice whenever
+                    // it is worth it; MMTK_SLICE_FEASIBLE=1 restores the old test.
+                    let feasible = if std::env::var_os("MMTK_SLICE_FEASIBLE").is_some() {
+                        minor_ms + quantum_ms <= slice_max_pause_ms()
+                    } else {
+                        true
+                    };
                     // true => monolithic Full instead of slicing.
                     let monolithic = !tick_origin && (!worth || !feasible);
                     if std::env::var_os("MMTK_PACE_DEBUG").is_some() {
                         eprintln!(
-                            "[pace] slice gate: debt={:.0}ms quantum={:.1}ms minor_ewma={:.1}ms tick={} worth={} feasible={} -> {}",
-                            debt_ms, quantum_ms, minor_ms, tick_origin, worth, feasible,
+                            "[pace] slice gate: debt={:.0}ms full_ewma={:.0}ms quantum={:.1}ms minor_ewma={:.1}ms tick={} worth={} feasible={} -> {}",
+                            debt_ms, full_ms, quantum_ms, minor_ms, tick_origin, worth, feasible,
                             if monolithic { "Full" } else { "sliced" }
                         );
                     }
@@ -1338,11 +1508,18 @@ impl<VM: VMBinding> Bactrian<VM> {
             use crate::plan::concurrent::diag;
             use std::sync::atomic::Ordering as O;
             eprintln!(
-                "[bactrian] {} {:?} (marking={}, mature_pages={}, seeded={}, enq={}, traced={}, skipped_young={}, satb={}, satb_young_drop={})",
+                "[bactrian] {} {:?} (marking={}, mature_pages={}, reserved={}, immix={}, los={}, nonmoving={}, nursery={}, heap={}, sweep_pending={}, seeded={}, enq={}, traced={}, skipped_young={}, satb={}, satb_young_drop={})",
                 what,
                 pause,
                 self.concurrent_marking_in_progress(),
                 self.immix_space.reserved_pages(),
+                self.get_reserved_pages(),
+                self.immix_space.reserved_pages(),
+                self.gen.common.get_los().reserved_pages(),
+                self.gen.common.get_nonmoving().reserved_pages(),
+                self.gen.nursery.reserved_pages(),
+                self.gen.common.base.gc_trigger.policy.get_current_heap_size_in_pages(),
+                self.sweep_pending.load(Ordering::SeqCst),
                 diag::SEEDED.load(O::Relaxed),
                 diag::ENQUEUED.load(O::Relaxed),
                 diag::TRACED.load(O::Relaxed),

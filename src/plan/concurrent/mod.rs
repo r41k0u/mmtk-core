@@ -23,6 +23,12 @@ pub(crate) mod diag {
     pub static SATB_ENQ: AtomicUsize = AtomicUsize::new(0);
     /// SATB old values handed to a ConcurrentTraceObjects packet (ProcessModBufSATB ran).
     pub static SATB_RUN: AtomicUsize = AtomicUsize::new(0);
+    /// Bytes of objects newly marked by the concurrent/sliced trace (each
+    /// object once: counted when it is enqueued for scanning). Per-cycle
+    /// deltas are the cycle's marked live size — the honest "live" for heap
+    /// sizing and pacing under a sliced cycle, where reserved pages after the
+    /// pause also contain the unswept garbage and everything born black.
+    pub static MARKED_BYTES: AtomicUsize = AtomicUsize::new(0);
     /// SATB old values dropped as young by the barrier.
     pub static SATB_YOUNG_DROP: AtomicUsize = AtomicUsize::new(0);
 }

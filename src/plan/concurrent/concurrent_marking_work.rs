@@ -89,6 +89,10 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     }
 
     fn scan_and_enqueue(&mut self, object: ObjectReference) {
+        crate::plan::concurrent::diag::MARKED_BYTES.fetch_add(
+            VM::VMObjectModel::get_current_size(object),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         crate::plan::tracing::SlotIterator::<VM>::iterate_fields(
             object,
             self.worker().tls.0,
