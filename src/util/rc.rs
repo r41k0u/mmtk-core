@@ -84,7 +84,9 @@ impl<VM: VMBinding> RefCountHelper<VM> {
 
     pub fn increase_inc_buffer_size(&self, delta: usize) {
         INC_BUFFER_SIZE.store(
-            INC_BUFFER_SIZE.load(Ordering::Relaxed).saturating_add(delta),
+            INC_BUFFER_SIZE
+                .load(Ordering::Relaxed)
+                .saturating_add(delta),
             Ordering::Relaxed,
         )
     }
@@ -188,8 +190,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         debug_assert!(size > Line::BYTES);
         // LXR: `Line::containing::<VM>(o).next()`. We align the object's address down to a line
         // and take the following line as the first continuation line.
-        let start_line =
-            Line::from_aligned_address(Line::align(o.to_raw_address())).next();
+        let start_line = Line::from_aligned_address(Line::align(o.to_raw_address())).next();
         let end_line = Line::from_aligned_address(Line::align(o.to_raw_address() + size));
         let mut line = start_line;
         while line != end_line {
@@ -207,8 +208,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     pub fn unmark_straddle_object(&self, o: ObjectReference) {
         let size = VM::VMObjectModel::get_current_size(o);
         if size > Line::BYTES {
-            let start_line =
-                Line::from_aligned_address(Line::align(o.to_raw_address())).next();
+            let start_line = Line::from_aligned_address(Line::align(o.to_raw_address())).next();
             let end_line = Line::from_aligned_address(Line::align(o.to_raw_address() + size));
             let mut line = start_line;
             while line != end_line {

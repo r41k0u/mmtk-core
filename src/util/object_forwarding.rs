@@ -38,7 +38,11 @@ fn sentinel_status<VM: VMBinding>(object: ObjectReference) -> u8 {
         None,
         Ordering::Relaxed,
     );
-    if word >= crate::util::heap::layout::vm_layout::vm_layout().heap_start.as_usize() {
+    if word
+        >= crate::util::heap::layout::vm_layout::vm_layout()
+            .heap_start
+            .as_usize()
+    {
         FORWARDED
     } else {
         FORWARDING_NOT_TRIGGERED_YET
@@ -153,12 +157,8 @@ pub fn forward_object<VM: VMBinding>(
         // forwarded yet — the header-pointer store above IS the state change
         // (a word >= heap start now reads FORWARDED); no side bits to set.
         if !header_sentinel_active::<VM>() {
-            VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC.store_atomic::<VM, u8>(
-                object,
-                FORWARDED,
-                None,
-                ord,
-            );
+            VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC
+                .store_atomic::<VM, u8>(object, FORWARDED, None, ord);
         }
     }
     new_object

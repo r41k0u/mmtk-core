@@ -107,9 +107,12 @@ impl ChunkMarkZeroing {
 
 impl<VM: VMBinding> GCWork<VM> for ChunkMarkZeroing {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
-        let ix = &mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap().immix_space;
-        let num_chunks =
-            (self.chunks.end.start() - self.chunks.start.start()) >> Chunk::LOG_BYTES;
+        let ix = &mmtk
+            .get_plan()
+            .downcast_ref::<LXR<VM>>()
+            .unwrap()
+            .immix_space;
+        let num_chunks = (self.chunks.end.start() - self.chunks.start.start()) >> Chunk::LOG_BYTES;
         for i in 0..num_chunks {
             let chunk = self.chunks.start.next_nth(i);
             if !ix.chunk_map.get(chunk).is_some() {
@@ -184,8 +187,7 @@ impl<VM: VMBinding> GCWork<VM> for SweepDeadCycles<VM> {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         let immix_space = &lxr.immix_space;
         let mut dead_blocks = 0;
-        let num_chunks =
-            (self.chunks.end.start() - self.chunks.start.start()) >> Chunk::LOG_BYTES;
+        let num_chunks = (self.chunks.end.start() - self.chunks.start.start()) >> Chunk::LOG_BYTES;
         for i in 0..num_chunks {
             let chunk = self.chunks.start.next_nth(i);
             if !immix_space.chunk_map.get(chunk).is_some() {

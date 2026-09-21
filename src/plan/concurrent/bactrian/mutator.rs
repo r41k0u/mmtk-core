@@ -2,18 +2,18 @@ use super::barrier::BactrianBarrier;
 use super::global::Bactrian;
 use crate::plan::concurrent::Pause;
 use crate::plan::mutator_context::create_allocator_mapping;
-use crate::plan::mutator_context::ReservedAllocators;
-use crate::util::alloc::allocators::AllocatorSelector;
-use crate::util::alloc::ImmixAllocator;
-use enum_map::EnumMap;
 use crate::plan::mutator_context::Mutator;
 use crate::plan::mutator_context::MutatorBuilder;
 use crate::plan::mutator_context::MutatorConfig;
+use crate::plan::mutator_context::ReservedAllocators;
 use crate::plan::AllocationSemantics;
+use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::alloc::BumpAllocator;
+use crate::util::alloc::ImmixAllocator;
 use crate::util::{VMMutatorThread, VMWorkerThread};
 use crate::vm::VMBinding;
 use crate::MMTK;
+use enum_map::EnumMap;
 
 #[cfg(feature = "marksweep_as_nonmoving")]
 fn common_nonmoving_prepare<VM: VMBinding>(mutator: &mut Mutator<VM>) {

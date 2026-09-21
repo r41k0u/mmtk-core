@@ -684,8 +684,7 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             .get_plan()
             .concurrent()
             .is_some_and(|c| c.concurrent_work_in_progress());
-        let concurrent_work_scheduled =
-            self.schedule_concurrent_packets(concurrent_marking_active);
+        let concurrent_work_scheduled = self.schedule_concurrent_packets(concurrent_marking_active);
         self.debug_assert_all_stw_buckets_closed();
 
         // Set to NotInGC after everything, and right before resuming mutators.

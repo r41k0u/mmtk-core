@@ -73,11 +73,10 @@ impl<VM: VMBinding> BactrianBarrier<VM> {
         if !buf.is_empty() {
             // The pause-aware Bactrian trace type: at InitialMark the remembered-set
             // scan must also seed the concurrent marker; at FinalMark it must remark.
-            self.mmtk.scheduler.work_buckets[WorkBucketStage::Closure].add(
-                crate::plan::generational::gc_work::ProcessModBuf::<
-                    BactrianNurseryProcessEdges<VM>,
-                >::new(buf),
-            );
+            self.mmtk.scheduler.work_buckets[WorkBucketStage::Closure]
+                .add(crate::plan::generational::gc_work::ProcessModBuf::<
+                BactrianNurseryProcessEdges<VM>,
+            >::new(buf));
         }
     }
 

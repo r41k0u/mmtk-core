@@ -626,8 +626,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             .collect();
         // Plain bulk_add (not bulk_add_prioritized): our base's Unconstrained bucket has no
         // prioritized queue (the reference's does) — bulk_add_prioritized unwraps None and aborts.
-        self.scheduler().work_buckets[WorkBucketStage::Unconstrained]
-            .bulk_add(packets);
+        self.scheduler().work_buckets[WorkBucketStage::Unconstrained].bulk_add(packets);
     }
 
     /// RC-pause prepare. Minimal cut: only the `Pause::RefCount` path is implemented (reset the
@@ -813,7 +812,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             // Arm the compaction-epoch madvise scope (cleared by the next
             // major's prepare): covers this GC's sweep — in-pause or the
             // deferred quanta draining across later nursery pauses.
-            self.madvise_freed_this_gc.store(compact_all, Ordering::Relaxed);
+            self.madvise_freed_this_gc
+                .store(compact_all, Ordering::Relaxed);
             let work_packets = self.chunk_map.generate_tasks(|chunk| {
                 Box::new(PrepareBlockState {
                     space,
@@ -1014,10 +1014,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // the compaction's purpose (mature_mutation: reserved collapsed
         // 46→7MB but RSS stayed flat without this). Steady-state recycling
         // between majors keeps the fast path (MMTK_RELEASE_FREED_PAGES).
-        self.pr.release_block_with(
-            block,
-            self.madvise_freed_this_gc.load(Ordering::Relaxed),
-        );
+        self.pr
+            .release_block_with(block, self.madvise_freed_this_gc.load(Ordering::Relaxed));
     }
 
     /// Push an already-deinitialised block back to the page resource free list (accounting +
@@ -1345,12 +1343,13 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     #[allow(dead_code)]
     pub(crate) fn attempt_mark_rc(&self, object: ObjectReference) -> bool {
         VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
-            .fetch_update_metadata::<VM, u8, _>(
-                object,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| if v != 0 { None } else { Some(1) },
-            )
+            .fetch_update_metadata::<VM, u8, _>(object, Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v != 0 {
+                    None
+                } else {
+                    Some(1)
+                }
+            })
             .is_ok()
     }
 
@@ -1358,12 +1357,13 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     #[allow(dead_code)]
     pub(crate) fn unmark_rc(&self, object: ObjectReference) -> bool {
         VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
-            .fetch_update_metadata::<VM, u8, _>(
-                object,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| if v != 1 { None } else { Some(0) },
-            )
+            .fetch_update_metadata::<VM, u8, _>(object, Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v != 1 {
+                    None
+                } else {
+                    Some(0)
+                }
+            })
             .is_ok()
     }
 

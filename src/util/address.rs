@@ -413,7 +413,11 @@ impl Address {
         VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
             .as_spec()
             .extract_side_spec()
-            .store_atomic(self, crate::plan::barriers::UNLOGGED_VALUE, Ordering::Relaxed)
+            .store_atomic(
+                self,
+                crate::plan::barriers::UNLOGGED_VALUE,
+                Ordering::Relaxed,
+            )
     }
 
     pub fn unlog_field_relaxed<VM: VMBinding>(self) {

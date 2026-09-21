@@ -7,9 +7,9 @@ use crate::plan::generational::global::GenerationalPlanExt;
 use crate::plan::global::PlanTraceObject;
 use crate::plan::VectorObjectQueue;
 use crate::policy::gc_work::TraceKind;
-use crate::policy::space::Space;
 use crate::policy::gc_work::DEFAULT_TRACE;
 use crate::policy::immix::TRACE_KIND_FAST;
+use crate::policy::space::Space;
 use crate::scheduler::gc_work::PlanProcessEdges;
 use crate::scheduler::gc_work::PlanScanObjects;
 use crate::scheduler::gc_work::ProcessEdgesBase;
@@ -26,7 +26,11 @@ use crate::vm::VMBinding;
 /// under UP (see Scanning::up_oldify_packet). Default OFF.
 fn up_oldify_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MMTK_UP_OLDIFY").map(|v| v == "1").unwrap_or(false))
+    *V.get_or_init(|| {
+        std::env::var("MMTK_UP_OLDIFY")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 use crate::MMTK;
 use std::ops::{Deref, DerefMut};
@@ -140,8 +144,7 @@ impl<VM: VMBinding> crate::vm::UpOldifyOps<VM> for BactrianOldifyOps<'_, VM> {
 
     fn is_young_los(&self, object: crate::util::ObjectReference) -> bool {
         use crate::policy::space::Space;
-        self.plan.gen.common.los.in_space(object)
-            && self.plan.gen.common.los.is_in_nursery(object)
+        self.plan.gen.common.los.in_space(object) && self.plan.gen.common.los.is_in_nursery(object)
     }
 
     fn promote_young_los(&mut self, object: crate::util::ObjectReference) -> bool {
@@ -206,11 +209,7 @@ impl<VM: VMBinding> BactrianMarkQuantum<VM> {
 }
 
 impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
-    fn do_work(
-        &mut self,
-        worker: &mut crate::scheduler::GCWorker<VM>,
-        mmtk: &'static MMTK<VM>,
-    ) {
+    fn do_work(&mut self, worker: &mut crate::scheduler::GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         // Work floor (budgeted quanta only): first drain at least as many
         // objects as were handed to marking packets since the previous quantum
         // finished — SATB old values the barrier parked between pauses and at
@@ -231,7 +230,8 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
         // inside a quantum, which is after this quota is read.
         let inflow_mark = || ENQUEUED.load(Relaxed) + SATB_ENQ.load(Relaxed);
         let quota = self.budget.map(|_| {
-            let inflow = inflow_mark().saturating_sub(self.plan.enqueued_at_last_quantum.load(Relaxed) as usize);
+            let inflow = inflow_mark()
+                .saturating_sub(self.plan.enqueued_at_last_quantum.load(Relaxed) as usize);
             // Runway floor: besides its own inflow, each slice retires enough
             // of the backlog for the cycle to finish before promotion consumes
             // the runway latched at InitialMark — stock's "slice work
@@ -244,7 +244,11 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
             // rate. Past the runway the heap overshoots the frozen limit by
             // promotion x the slices left — bounded — instead of one slice
             // draining everything (sedlex: 16-38 s).
-            let avail_runway = if promo == 0 { u64::MAX } else { (runway / promo).max(1) };
+            let avail_runway = if promo == 0 {
+                u64::MAX
+            } else {
+                (runway / promo).max(1)
+            };
             let rate = self.plan.mark_rate_x256();
             let min_slices = if rate == 0 {
                 1
@@ -252,8 +256,13 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
                 let backlog_ms = backlog as f64 * 256.0 / rate as f64;
                 (backlog_ms / self.plan.slice_target_ms()).ceil().max(1.0) as u64
             };
-            let avail = std::cmp::max(std::cmp::min(avail_runway, u64::MAX / 2), min_slices) as usize;
-            let share = if promo == 0 && rate == 0 { 0 } else { backlog.div_ceil(avail) };
+            let avail =
+                std::cmp::max(std::cmp::min(avail_runway, u64::MAX / 2), min_slices) as usize;
+            let share = if promo == 0 && rate == 0 {
+                0
+            } else {
+                backlog.div_ceil(avail)
+            };
             inflow + share
         });
         let traced_at_start = TRACED.load(Relaxed);
@@ -298,7 +307,8 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
             (TRACED.load(Relaxed) - traced_at_start) as u64,
             started.elapsed().as_nanos() as u64,
         );
-        self.plan.note_quantum_nanos(started.elapsed().as_nanos() as u64);
+        self.plan
+            .note_quantum_nanos(started.elapsed().as_nanos() as u64);
         if let Some(q) = quota {
             // Projection guard: at the measured net rate (objects of backlog
             // retired per slice, EWMA), does the backlog finish before
@@ -314,8 +324,16 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
             let (promo, runway) = self.plan.sample_promotion();
             let backlog = self.plan.mark_backlog_objects();
             let drained = self.plan.marking_queue_drained();
-            let need = if net_ewma == 0 { f64::INFINITY } else { backlog as f64 / net_ewma as f64 };
-            let avail = if promo == 0 { f64::INFINITY } else { runway as f64 / promo as f64 };
+            let need = if net_ewma == 0 {
+                f64::INFINITY
+            } else {
+                backlog as f64 / net_ewma as f64
+            };
+            let avail = if promo == 0 {
+                f64::INFINITY
+            } else {
+                runway as f64 / promo as f64
+            };
             // With the runway-paced, target-capped share above, the slices
             // already finish the cycle inside the runway or overshoot it by a
             // bounded amount; an unbudgeted drain here would just be the
@@ -374,7 +392,10 @@ fn sweep_slice_budget() -> std::time::Duration {
 
 impl<VM: VMBinding> BactrianSweepQuantum<VM> {
     pub(in crate::plan) fn budgeted(plan: &'static Bactrian<VM>) -> Self {
-        Self { plan, budget: Some(sweep_slice_budget()) }
+        Self {
+            plan,
+            budget: Some(sweep_slice_budget()),
+        }
     }
     pub(in crate::plan) fn unbudgeted(plan: &'static Bactrian<VM>) -> Self {
         Self { plan, budget: None }
@@ -382,11 +403,7 @@ impl<VM: VMBinding> BactrianSweepQuantum<VM> {
 }
 
 impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
-    fn do_work(
-        &mut self,
-        worker: &mut crate::scheduler::GCWorker<VM>,
-        mmtk: &'static MMTK<VM>,
-    ) {
+    fn do_work(&mut self, worker: &mut crate::scheduler::GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let deadline = self.budget.map(|b| std::time::Instant::now() + b);
         // Sample this pause's promotion BEFORE sweeping (the sweep frees
         // mature pages, which would hide it) — see sample_promotion.
@@ -408,7 +425,11 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
         // past the runway the next cycle waits a little longer rather than
         // one slice sweeping gigabytes.
         let cap = std::time::Duration::from_secs_f64(
-            std::env::var("MMTK_SWEEP_SLICE_CAP_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(20.0) / 1e3,
+            std::env::var("MMTK_SWEEP_SLICE_CAP_MS")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(20.0)
+                / 1e3,
         );
         let started = std::time::Instant::now();
         let mut packets = 0usize;
@@ -449,7 +470,8 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
                 }
             }
         }
-        self.plan.note_quantum_nanos(started.elapsed().as_nanos() as u64);
+        self.plan
+            .note_quantum_nanos(started.elapsed().as_nanos() as u64);
         if let Some((promo, runway)) = promo_runway {
             // Projection guard for the sweep: a pending cycle request waits on
             // this drain, so at the measured packets-per-slice rate the
@@ -462,7 +484,11 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
             } else {
                 remaining as f64 * 256.0 / ewma_x256 as f64
             };
-            let avail = if promo == 0 { f64::INFINITY } else { runway as f64 / promo as f64 };
+            let avail = if promo == 0 {
+                f64::INFINITY
+            } else {
+                runway as f64 / promo as f64
+            };
             let escalate = remaining > 0 && slices >= 2 && need > avail;
             if escalate {
                 self.plan.request_escalate_sweep();
@@ -621,11 +647,13 @@ impl<VM: VMBinding> ProcessEdgesWork for BactrianNurseryProcessEdges<VM> {
                     // newly-marked objects are enqueued to base.nodes and scanned
                     // with this same trace. Already-marked objects are a mark-bit
                     // check only.
-                    let marked = self.plan.trace_object::<VectorObjectQueue, TRACE_KIND_FAST>(
-                        &mut self.base.nodes,
-                        object,
-                        worker,
-                    );
+                    let marked = self
+                        .plan
+                        .trace_object::<VectorObjectQueue, TRACE_KIND_FAST>(
+                            &mut self.base.nodes,
+                            object,
+                            worker,
+                        );
                     debug_assert_eq!(marked, object, "FinalMark remark must not move");
                 }
                 _ => (),
@@ -686,9 +714,7 @@ impl<VM: VMBinding> ProcessEdgesWork for BactrianNurseryProcessEdges<VM> {
         // Single tracer: finish the whole closure here (see drain_closure_locally).
         // Gated off when live-bytes stats are requested — the packet path is the
         // one that accounts them.
-        if crate::util::up_trace::up()
-            && !*self.base.mmtk().get_options().count_live_bytes_in_gc
-        {
+        if crate::util::up_trace::up() && !*self.base.mmtk().get_options().count_live_bytes_in_gc {
             self.drain_closure_locally();
         }
         self.flush_mark_seed();

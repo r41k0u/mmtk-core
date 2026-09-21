@@ -29,7 +29,6 @@ pub trait UpOldifyOps<VM: crate::vm::VMBinding> {
     fn promote_young_los(&mut self, object: crate::util::ObjectReference) -> bool;
 }
 
-
 use crate::vm::slot::Slot;
 use crate::vm::VMBinding;
 

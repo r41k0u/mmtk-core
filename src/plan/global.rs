@@ -107,16 +107,12 @@ pub fn create_plan<VM: VMBinding>(
             Box::new(crate::plan::concurrent::immix::ConcurrentImmix::new(args))
                 as Box<dyn Plan<VM = VM>>
         }
-        PlanSelector::Bactrian => {
-            Box::new(crate::plan::concurrent::bactrian::Bactrian::new(args))
-                as Box<dyn Plan<VM = VM>>
-        }
+        PlanSelector::Bactrian => Box::new(crate::plan::concurrent::bactrian::Bactrian::new(args))
+            as Box<dyn Plan<VM = VM>>,
         PlanSelector::Compressor => {
             Box::new(crate::plan::compressor::Compressor::new(args)) as Box<dyn Plan<VM = VM>>
         }
-        PlanSelector::LXR => {
-            Box::new(crate::plan::lxr::LXR::new(args)) as Box<dyn Plan<VM = VM>>
-        }
+        PlanSelector::LXR => Box::new(crate::plan::lxr::LXR::new(args)) as Box<dyn Plan<VM = VM>>,
     };
 
     // We have created Plan in the heap, and we won't explicitly move it.

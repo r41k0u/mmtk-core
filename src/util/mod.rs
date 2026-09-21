@@ -36,13 +36,13 @@ pub mod metadata;
 pub mod opaque_pointer;
 /// MMTk command line options.
 pub mod options;
-/// Single-tracer plain-operation trace mode (see module docs).
-pub mod up_trace;
 #[cfg(feature = "test_private")]
 pub mod test_private;
 /// Test utilities. We need this module for `MockVM` in criterion benches, which does not include code with `cfg(test)`.
 #[cfg(any(test, feature = "mock_test"))]
 pub mod test_util;
+/// Single-tracer plain-operation trace mode (see module docs).
+pub mod up_trace;
 
 // The following modules are only public in the mmtk crate. They should only be used in MMTk core.
 /// An analysis framework for collecting data and profiling in GC.
@@ -58,10 +58,10 @@ pub(crate) mod logger;
 pub(crate) mod object_enum;
 /// Forwarding word in object copying.
 pub(crate) mod object_forwarding;
-/// Reference processing implementation.
-pub(crate) mod reference_processor;
 /// LXR reference-counting helpers (P1 scaffolding — additive, used by the LXR plan only).
 pub(crate) mod rc;
+/// Reference processing implementation.
+pub(crate) mod reference_processor;
 /// Utilities funcitons for Rust
 pub(crate) mod rust_util;
 /// Sanity checker for GC.

@@ -251,8 +251,7 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
             let line_start = object.to_raw_address().align_down(256);
             let line_mark = crate::policy::immix::line::Line::MARK_TABLE
                 .load_atomic::<u8>(line_start, atomic::Ordering::SeqCst);
-            let header: usize =
-                unsafe { object.to_raw_address().sub(8).load::<usize>() };
+            let header: usize = unsafe { object.to_raw_address().sub(8).load::<usize>() };
             panic!(
                 "VO bit is not set: {} (space: {}, mark_bit: {}, line_mark: {}, header: {:#x})",
                 object, space_name, mark, line_mark, header

@@ -117,7 +117,12 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
     }
 
     /// The slow path: buffer a decrement of the old referent and an increment of the slot.
-    fn slow(&mut self, _src: Option<ObjectReference>, slot: VM::VMSlot, old: Option<ObjectReference>) {
+    fn slow(
+        &mut self,
+        _src: Option<ObjectReference>,
+        slot: VM::VMSlot,
+        old: Option<ObjectReference>,
+    ) {
         if let Some(old) = old {
             self.decs.push(old);
             if self.decs.is_full() {
@@ -149,8 +154,12 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
         if !self.incs.is_empty() {
             let incs = self.incs.take();
             self.lxr.rc.increase_inc_buffer_size(incs.len());
-            self.mmtk.scheduler.work_buckets[WorkBucketStage::RCProcessIncs]
-                .add(ProcessIncs::<_, EDGE_KIND_MATURE>::new(incs, self.lxr));
+            self.mmtk.scheduler.work_buckets[WorkBucketStage::RCProcessIncs].add(ProcessIncs::<
+                _,
+                EDGE_KIND_MATURE,
+            >::new(
+                incs, self.lxr
+            ));
         }
     }
 

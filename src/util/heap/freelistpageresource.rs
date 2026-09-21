@@ -5,9 +5,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 #[cfg(target_os = "linux")]
 pub fn release_los_pages() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("MMTK_RELEASE_LOS_PAGES").map_or(true, |v| v != "0")
-    })
+    *ENABLED.get_or_init(|| std::env::var("MMTK_RELEASE_LOS_PAGES").map_or(true, |v| v != "0"))
 }
 
 use super::layout::vm_layout::PAGES_IN_CHUNK;

@@ -65,22 +65,20 @@ impl<VM: VMBinding> GCTrigger<VM> {
 
                     Box::new(MemBalancerTrigger::new(min_pages, max_pages))
                 }
-                GCTriggerSelector::SpaceOverheadSize(min, max, overhead_pct) => {
-                    'space_overhead: {
-                        let min_pages = conversions::bytes_to_pages_up(min);
-                        let max_pages = conversions::bytes_to_pages_up(max);
-                        if *options.plan == crate::util::options::PlanSelector::NoGC {
-                            warn!("Cannot use space-overhead heap size with NoGC. Using fixed heap size (max) instead.");
-                            break 'space_overhead Box::new(FixedHeapSizeTrigger {
-                                total_pages: max_pages,
-                            });
-                        }
-                        Box::new(SpaceOverheadTrigger::new(
-                            min_pages,
-                            max_pages,
-                            overhead_pct as f64 / 100.0,
-                        ))
+                GCTriggerSelector::SpaceOverheadSize(min, max, overhead_pct) => 'space_overhead: {
+                    let min_pages = conversions::bytes_to_pages_up(min);
+                    let max_pages = conversions::bytes_to_pages_up(max);
+                    if *options.plan == crate::util::options::PlanSelector::NoGC {
+                        warn!("Cannot use space-overhead heap size with NoGC. Using fixed heap size (max) instead.");
+                        break 'space_overhead Box::new(FixedHeapSizeTrigger {
+                            total_pages: max_pages,
+                        });
                     }
+                    Box::new(SpaceOverheadTrigger::new(
+                        min_pages,
+                        max_pages,
+                        overhead_pct as f64 / 100.0,
+                    ))
                 }
                 GCTriggerSelector::Delegated => {
                     <VM::VMCollection as crate::vm::Collection<VM>>::create_gc_trigger()
@@ -99,8 +97,7 @@ impl<VM: VMBinding> GCTrigger<VM> {
     /// (an explicit pin stays authoritative; a proportional nursery already scales with the
     /// heap). Takes effect lazily at the next trigger check. `scale` is clamped to >= 1.
     pub fn set_nursery_scale(&self, scale: usize) {
-        self.nursery_scale
-            .store(scale.max(1), Ordering::Relaxed);
+        self.nursery_scale.store(scale.max(1), Ordering::Relaxed);
     }
 
     /// Set the plan. This is called in `create_plan()` after we created a boxed plan.
@@ -252,9 +249,8 @@ impl<VM: VMBinding> GCTrigger<VM> {
                 let scale = self.nursery_scale.load(Ordering::Relaxed);
                 let scaled = max.saturating_mul(scale);
                 let scaled_min = min.saturating_mul(scale);
-                let quarter_heap = conversions::pages_to_bytes(
-                    self.policy.get_current_heap_size_in_pages(),
-                ) / 4;
+                let quarter_heap =
+                    conversions::pages_to_bytes(self.policy.get_current_heap_size_in_pages()) / 4;
                 std::cmp::max(scaled_min, std::cmp::min(scaled, quarter_heap))
             }
             NurserySize::ProportionalBounded { min: _, max } => {
@@ -544,7 +540,8 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
             // degraded to a Full), or half the overhead of the marked live
             // set once a sliced cycle has measured it.
             let marked_pages = conversions::bytes_to_pages_up(marked);
-            let nursery_pages = conversions::bytes_to_pages_up(mmtk.gc_trigger.get_max_nursery_bytes());
+            let nursery_pages =
+                conversions::bytes_to_pages_up(mmtk.gc_trigger.get_max_nursery_bytes());
             let headroom = std::cmp::max(
                 nursery_headroom_pages + 2 * nursery_pages,
                 ((marked_pages as f64) * self.overhead * 0.5) as usize,
@@ -556,9 +553,13 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
             } else if is_final_mark && sweep_pending {
                 self.resize_after_sweep.store(true, Ordering::Relaxed);
                 self.current_heap_pages.fetch_max(floor, Ordering::Relaxed);
-            } else if (is_final_mark || self.resize_after_sweep.load(Ordering::Relaxed)) && !sweep_pending {
-                let from_marked = ((marked_pages as f64) * (1.0 + self.overhead)) as usize + nursery_headroom_pages;
-                let t = std::cmp::max(from_marked, floor).clamp(self.min_heap_pages, self.max_heap_pages);
+            } else if (is_final_mark || self.resize_after_sweep.load(Ordering::Relaxed))
+                && !sweep_pending
+            {
+                let from_marked = ((marked_pages as f64) * (1.0 + self.overhead)) as usize
+                    + nursery_headroom_pages;
+                let t = std::cmp::max(from_marked, floor)
+                    .clamp(self.min_heap_pages, self.max_heap_pages);
                 self.current_heap_pages.store(t, Ordering::Relaxed);
                 self.resize_after_sweep.store(false, Ordering::Relaxed);
             } else {
@@ -573,7 +574,8 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
         } else if full_gc {
             self.current_heap_pages.store(clamped, Ordering::Relaxed);
         } else {
-            self.current_heap_pages.fetch_max(clamped, Ordering::Relaxed);
+            self.current_heap_pages
+                .fetch_max(clamped, Ordering::Relaxed);
         }
     }
 
@@ -583,7 +585,8 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for SpaceOverheadTrigger {
         if full {
             // Reserved still includes the pending reservation here; remember it
             // for the post-GC resize (see field doc).
-            self.pending_demand_pages.fetch_max(reserved, Ordering::Relaxed);
+            self.pending_demand_pages
+                .fetch_max(reserved, Ordering::Relaxed);
         }
         full
     }

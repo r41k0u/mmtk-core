@@ -553,7 +553,9 @@ impl<VM: VMBinding> ProcessEdgesWork for RCImmixCollectRootEdges<VM> {
                         VM,
                         LXR<VM>,
                         { crate::policy::immix::TRACE_KIND_FAST },
-                    >::new(mark_roots, true, self.mmtk(), WorkBucketStage::Closure),
+                    >::new(
+                        mark_roots, true, self.mmtk(), WorkBucketStage::Closure
+                    ),
                 );
             }
             let roots = std::mem::take(&mut self.slots);

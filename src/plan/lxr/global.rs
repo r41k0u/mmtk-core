@@ -3,12 +3,6 @@ use super::gc_work::LXRRCWorkContext;
 use super::mutator::ALLOCATOR_MAPPING;
 use super::rc::ProcessDecs;
 use super::rc::RCImmixCollectRootEdges;
-use crate::scheduler::gc_work::Release;
-use crate::scheduler::gc_work::StopMutators;
-use crate::scheduler::gc_work::UnsupportedProcessEdges;
-use crate::LazySweepingJobsCounter;
-use crossbeam::queue::SegQueue;
-use std::sync::RwLock;
 use crate::plan::global::BasePlan;
 use crate::plan::global::CommonPlan;
 use crate::plan::global::CreateGeneralPlanArgs;
@@ -18,6 +12,9 @@ use crate::plan::Plan;
 use crate::plan::PlanConstraints;
 use crate::policy::immix::ImmixSpaceArgs;
 use crate::policy::space::Space;
+use crate::scheduler::gc_work::Release;
+use crate::scheduler::gc_work::StopMutators;
+use crate::scheduler::gc_work::UnsupportedProcessEdges;
 use crate::scheduler::*;
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::copy::*;
@@ -25,11 +22,14 @@ use crate::util::heap::gc_trigger::SpaceStats;
 use crate::util::heap::VMRequest;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::rc::RefCountHelper;
+use crate::util::ObjectReference;
 use crate::vm::ObjectModel;
 use crate::vm::VMBinding;
-use crate::util::ObjectReference;
+use crate::LazySweepingJobsCounter;
 use crate::{policy::immix::ImmixSpace, util::opaque_pointer::VMWorkerThread};
+use crossbeam::queue::SegQueue;
 use std::sync::atomic::AtomicBool;
+use std::sync::RwLock;
 
 use super::Pause;
 use atomic::Atomic;
@@ -112,7 +112,8 @@ pub struct LXR<VM: VMBinding> {
     /// Reference-counting helper (RC_TABLE access + promote/dead bookkeeping). Inert
     /// until the RC trace (`ProcessIncs`/`ProcessDecs`) and the field barrier are wired
     /// and `rc_enabled` is flipped on; present now as the foundation those steps build on.
-    #[allow(dead_code)] // read by the RC trace (ProcessIncs/ProcessDecs), wired in a later P3 step
+    #[allow(dead_code)]
+    // read by the RC trace (ProcessIncs/ProcessDecs), wired in a later P3 step
     pub rc: RefCountHelper<VM>,
     /// The kind of the in-progress GC pause (`None` outside a pause). Set in `schedule_collection`,
     /// read by the RC trace + scheduling. Mirrors the same field on the ConcurrentImmix plan.
@@ -193,7 +194,10 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         match pause {
             Pause::RefCount => self.schedule_rc_collection(scheduler),
             Pause::Full => self.schedule_full_collection(scheduler),
-            _ => unreachable!("LXR cut only schedules RefCount + Full pauses, got {:?}", pause),
+            _ => unreachable!(
+                "LXR cut only schedules RefCount + Full pauses, got {:?}",
+                pause
+            ),
         }
     }
 
@@ -303,12 +307,7 @@ impl<VM: VMBinding> LXR<VM> {
         };
         let lxr = LXR {
             immix_space: ImmixSpace::new(
-                plan_args.get_normal_space_args(
-                    "immix",
-                    true,
-                    false,
-                    VMRequest::discontiguous(),
-                ),
+                plan_args.get_normal_space_args("immix", true, false, VMRequest::discontiguous()),
                 ImmixSpaceArgs {
                     mixed_age: false,
                     // Minimal RC cut: in-place promotion only, never evacuate. Matches
