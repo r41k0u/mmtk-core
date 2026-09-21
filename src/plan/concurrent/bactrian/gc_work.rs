@@ -211,7 +211,32 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
         worker: &mut crate::scheduler::GCWorker<VM>,
         mmtk: &'static MMTK<VM>,
     ) {
-        let deadline = self.budget.map(|b| std::time::Instant::now() + b);
+        // Work floor (budgeted quanta only): first drain at least as many
+        // objects as were handed to marking packets since the previous quantum
+        // finished — SATB old values the barrier parked between pauses and at
+        // mutator flush, plus the nursery closure's seeds — and only THEN run
+        // the time budget. The time budget alone is a rate guess (debt over
+        // runway pauses at an assumed mark rate, re-derived every minor against
+        // a heap that grows while the cycle is open); if the inflow outruns it
+        // the parked queue only grows and the cycle never reaches FinalMark
+        // (eio_conc: 60-125k SATB entries per minor vs ~50k traced in a 2-5 ms
+        // quantum; the queue hovered at ~1M objects for 1600 minors, RSS 3 ->
+        // 24 GB). Inflow and budget ADD: a max() of the two only holds the
+        // queue steady and never drains it. The quantum's own child packets are
+        // not inflow: the snapshot is taken after the drain.
+        use crate::plan::concurrent::diag::{ENQUEUED, SATB_ENQ, TRACED};
+        use std::sync::atomic::Ordering::Relaxed;
+        // SATB old values are counted at enqueue time (SATB_ENQ, mutator side):
+        // their ProcessModBufSATB packets only feed ENQUEUED when they execute
+        // inside a quantum, which is after this quota is read.
+        let inflow_mark = || ENQUEUED.load(Relaxed) + SATB_ENQ.load(Relaxed);
+        let quota = self.budget.map(|_| {
+            inflow_mark().saturating_sub(self.plan.enqueued_at_last_quantum.load(Relaxed) as usize)
+        });
+        let traced_at_start = TRACED.load(Relaxed);
+        let started = std::time::Instant::now();
+        // Armed once the quota is met; None while the floor is being worked.
+        let mut deadline: Option<std::time::Instant> = None;
         let mut packets = 0usize;
         // Run the drain under full-heap LOS semantics (mid-cycle marking must
         // mark mature LOS objects even when the enclosing pause latched
@@ -224,9 +249,18 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
         while let Some(mut w) = self.plan.pop_marking_packet() {
             w.do_work(worker, mmtk);
             packets += 1;
-            if let Some(d) = deadline {
-                if std::time::Instant::now() >= d {
-                    break;
+            if let Some(b) = self.budget {
+                match deadline {
+                    None => {
+                        if TRACED.load(Relaxed) - traced_at_start >= quota.unwrap_or(0) {
+                            deadline = Some(std::time::Instant::now() + b);
+                        }
+                    }
+                    Some(d) => {
+                        if std::time::Instant::now() >= d {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -234,6 +268,50 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianMarkQuantum<VM> {
             .common()
             .los
             .set_marking_full_semantics(was_full);
+        self.plan
+            .enqueued_at_last_quantum
+            .store(inflow_mark() as u64, Relaxed);
+        if let Some(q) = quota {
+            // Projection guard: at the measured net rate (objects of backlog
+            // retired per slice, EWMA), does the backlog finish before
+            // promotion (pages per minor, EWMA) consumes the runway? If not,
+            // the next quantum runs unbudgeted — drain in one pause, FinalMark
+            // next — the legal mid-cycle equivalent of giving up on slicing (a
+            // Full cannot start with a cycle in flight). A short warm-up keeps
+            // a bursty first few slices from firing it. A queue that is not
+            // shrinking at all is the infinite case of the same test.
+            let traced = TRACED.load(Relaxed) - traced_at_start;
+            let net = traced.saturating_sub(q) as u64;
+            let (net_ewma, slices) = self.plan.note_mark_slice(net);
+            let (promo, runway) = self.plan.sample_promotion();
+            let backlog = self.plan.mark_backlog_objects();
+            let drained = self.plan.marking_queue_drained();
+            let need = if net_ewma == 0 { f64::INFINITY } else { backlog as f64 / net_ewma as f64 };
+            let avail = if promo == 0 { f64::INFINITY } else { runway as f64 / promo as f64 };
+            let escalate = !drained && slices >= 4 && need > avail;
+            if escalate {
+                self.plan.request_escalate_mark();
+            }
+            if std::env::var_os("MMTK_PACE_DEBUG").is_some() {
+                eprintln!(
+                    "[pace] quantum: budget={:.1}ms quota={} traced={} packets={} took={:.1}ms drained={} | guard: backlog={} net={}/slice promo={}p runway={}MB need={:.0} avail={:.0} slices={}{}",
+                    self.budget.map(|b| b.as_secs_f64() * 1e3).unwrap_or(0.0),
+                    q,
+                    traced,
+                    packets,
+                    started.elapsed().as_secs_f64() * 1e3,
+                    drained,
+                    backlog,
+                    net_ewma,
+                    promo,
+                    runway * 4096 / (1 << 20),
+                    need,
+                    avail,
+                    slices,
+                    if escalate { " -> ESCALATE" } else { "" }
+                );
+            }
+        }
         probe!(mmtk, bactrian_mark_quantum, packets);
     }
 }
@@ -280,6 +358,10 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
         mmtk: &'static MMTK<VM>,
     ) {
         let deadline = self.budget.map(|b| std::time::Instant::now() + b);
+        // Sample this pause's promotion BEFORE sweeping (the sweep frees
+        // mature pages, which would hide it) — see sample_promotion.
+        let promo_runway = self.budget.map(|_| self.plan.sample_promotion());
+        let started = std::time::Instant::now();
         let mut packets = 0usize;
         loop {
             let Some(mut w) = self.plan.pop_sweep_packet() else {
@@ -315,6 +397,39 @@ impl<VM: VMBinding> crate::scheduler::GCWork<VM> for BactrianSweepQuantum<VM> {
                     }
                     break;
                 }
+            }
+        }
+        if let Some((promo, runway)) = promo_runway {
+            // Projection guard for the sweep: a pending cycle request waits on
+            // this drain, so at the measured packets-per-slice rate the
+            // remaining chunks must be swept before promotion consumes the
+            // runway; otherwise the next sweep quantum runs unbudgeted.
+            let (ewma_x256, slices) = self.plan.note_sweep_slice(packets as u64);
+            let remaining = self.plan.sweep_packets_remaining();
+            let need = if ewma_x256 == 0 {
+                f64::INFINITY
+            } else {
+                remaining as f64 * 256.0 / ewma_x256 as f64
+            };
+            let avail = if promo == 0 { f64::INFINITY } else { runway as f64 / promo as f64 };
+            let escalate = remaining > 0 && slices >= 2 && need > avail;
+            if escalate {
+                self.plan.request_escalate_sweep();
+            }
+            if std::env::var_os("MMTK_PACE_DEBUG").is_some() {
+                eprintln!(
+                    "[pace] sweep quantum: packets={} took={:.1}ms remaining={} rate={:.1}/slice promo={}p runway={}MB need={:.0} avail={:.0} slices={}{}",
+                    packets,
+                    started.elapsed().as_secs_f64() * 1e3,
+                    remaining,
+                    ewma_x256 as f64 / 256.0,
+                    promo,
+                    runway * 4096 / (1 << 20),
+                    need,
+                    avail,
+                    slices,
+                    if escalate { " -> ESCALATE" } else { "" }
+                );
             }
         }
         probe!(mmtk, bactrian_sweep_quantum, packets);

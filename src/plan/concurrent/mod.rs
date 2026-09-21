@@ -21,6 +21,8 @@ pub(crate) mod diag {
     pub static SEEDED: AtomicUsize = AtomicUsize::new(0);
     /// SATB old values enqueued by the barrier.
     pub static SATB_ENQ: AtomicUsize = AtomicUsize::new(0);
+    /// SATB old values handed to a ConcurrentTraceObjects packet (ProcessModBufSATB ran).
+    pub static SATB_RUN: AtomicUsize = AtomicUsize::new(0);
     /// SATB old values dropped as young by the barrier.
     pub static SATB_YOUNG_DROP: AtomicUsize = AtomicUsize::new(0);
 }

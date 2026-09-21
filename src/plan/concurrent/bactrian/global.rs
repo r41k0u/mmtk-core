@@ -131,6 +131,41 @@ pub struct Bactrian<VM: VMBinding> {
     nursery_pause_ewma_nanos: AtomicU64,
     /// now_nanos() at the current pause's prepare(), for the EWMA above.
     pause_start_nanos: AtomicU64,
+    /// Inflow mark (diag::ENQUEUED + diag::SATB_ENQ) when the previous mark
+    /// quantum finished (or when InitialMark ended). Everything since then —
+    /// SATB old values the barrier recorded between pauses (counted at
+    /// enqueue time: their ProcessModBufSATB packets only reach ENQUEUED when
+    /// they run inside a quantum), plus whatever the nursery closure seeds —
+    /// is the inflow the next quantum must retire before its time budget
+    /// starts (see BactrianMarkQuantum). A quantum's own child packets are
+    /// excluded: it snapshots after its drain.
+    pub(in crate::plan) enqueued_at_last_quantum: AtomicU64,
+    /// Mature reserved pages at this pause's prepare(); the Release-stage
+    /// quanta read the pause's promotion as (mature now − this).
+    mature_at_prepare: AtomicU64,
+    /// EWMA (alpha 1/4) of pages promoted per nursery pause, sampled in the
+    /// quanta: the projection guards' "minors available" = runway / this.
+    promotion_ewma_pages: AtomicU64,
+    /// EWMA (alpha 1/4) of a budgeted mark quantum's net progress in objects
+    /// (traced − inflow; ≥ 0 under the inflow floor). 0 = no sample yet.
+    mark_net_ewma: AtomicU64,
+    /// Budgeted mark quanta run in the current cycle (warm-up before the
+    /// projection guard judges).
+    mark_slices_this_cycle: AtomicU64,
+    /// (SATB_ENQ − SATB_RUN) at InitialMark: records made outside a cycle are
+    /// dropped unexecuted, so the in-cycle backlog is measured from here.
+    satb_drift_at_cycle_start: AtomicU64,
+    /// EWMA (alpha 1/4, ×256 fixed point) of sweep packets completed per
+    /// budgeted sweep quantum, and the budgeted sweep quanta run since
+    /// FinalMark (warm-up).
+    sweep_packets_ewma_x256: AtomicU64,
+    sweep_slices_this_cycle: AtomicU64,
+    /// Set by the projection guards (see BactrianMarkQuantum /
+    /// BactrianSweepQuantum): the next mark / sweep quantum runs unbudgeted —
+    /// drain to completion in one pause — because at the measured net rate the
+    /// work would not finish before promotion consumed the runway.
+    escalate_mark: AtomicBool,
+    escalate_sweep: AtomicBool,
     /// Pending mature-compaction request (ConcurrentPlan::
     /// request_mature_compaction — the binding's reserved-vs-live runaway
     /// law). Consumed by decide_pause: rides the next major as a COMPACT-ALL
@@ -271,7 +306,9 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                         // backlog; a budgeted drain would loop failing polls).
                         Pause::Nursery if self.concurrent_marking_in_progress() => {
                             let emergency = self.genuine_allocation_emergency();
-                            let w = if emergency {
+                            let w = if emergency
+                                || self.escalate_mark.swap(false, Ordering::SeqCst)
+                            {
                                 BactrianMarkQuantum::unbudgeted(self)
                             } else {
                                 BactrianMarkQuantum::budgeted(self)
@@ -311,7 +348,9 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                         // previous sweep, and an eager drain-all doubled the
                         // minor pause max (8.2 -> 14.4ms measured at bt@2M).
                         let emergency = self.genuine_allocation_emergency();
-                        let w = if emergency {
+                        let w = if emergency
+                            || self.escalate_sweep.swap(false, Ordering::SeqCst)
+                        {
                             BactrianSweepQuantum::unbudgeted(self)
                         } else {
                             BactrianSweepQuantum::budgeted(self)
@@ -330,6 +369,8 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
     fn prepare(&mut self, tls: VMWorkerThread) {
         let pause = self.current_pause().unwrap();
         self.pause_start_nanos.store(now_nanos(), Ordering::Relaxed);
+        self.mature_at_prepare
+            .store(self.get_mature_reserved_pages() as u64, Ordering::Relaxed);
         match pause {
             Pause::Full => {
                 // GenImmix's full-heap protocol: bulk-clear unlog bits; the full trace
@@ -514,10 +555,29 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
         match pause {
             Pause::InitialMark => {
                 // Marking state was already armed in prepare() (this pause's own
-                // promotions must be born live); nothing further to do here.
+                // promotions must be born live). The seeds InitialMark enqueued
+                // are the cycle's initial debt, not inflow: start the quanta's
+                // inflow window here.
+                self.enqueued_at_last_quantum.store(
+                    (crate::plan::concurrent::diag::ENQUEUED.load(Ordering::Relaxed)
+                        + crate::plan::concurrent::diag::SATB_ENQ.load(Ordering::Relaxed))
+                        as u64,
+                    Ordering::Relaxed,
+                );
+                self.mark_net_ewma.store(0, Ordering::Relaxed);
+                self.mark_slices_this_cycle.store(0, Ordering::Relaxed);
+                self.satb_drift_at_cycle_start.store(
+                    crate::plan::concurrent::diag::SATB_ENQ
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(crate::plan::concurrent::diag::SATB_RUN.load(Ordering::Relaxed))
+                        as u64,
+                    Ordering::Relaxed,
+                );
                 debug_assert!(self.concurrent_marking_in_progress());
             }
             Pause::FinalMark => {
+                self.sweep_packets_ewma_x256.store(0, Ordering::Relaxed);
+                self.sweep_slices_this_cycle.store(0, Ordering::Relaxed);
                 // End the MARKING half of the cycle, but under INCREMENTAL
                 // SWEEP keep allocate-as-live armed until the deferred sweep
                 // drains: a pretenured (mature-direct) object born after this
@@ -892,6 +952,72 @@ impl<VM: VMBinding> Bactrian<VM> {
         self.parked_sweep.is_empty()
     }
 
+    /// Parked sweep packets still to run (one chunk each).
+    pub(super) fn sweep_packets_remaining(&self) -> usize {
+        self.parked_sweep.len()
+    }
+
+    /// Pages between the trigger's current heap size and mature: what
+    /// promotion can consume before the heap is full.
+    pub(super) fn runway_pages(&self) -> usize {
+        self.gen
+            .common
+            .base
+            .gc_trigger
+            .policy
+            .get_current_heap_size_in_pages()
+            .saturating_sub(self.get_mature_reserved_pages())
+    }
+
+    /// Objects still to trace in this cycle: parked-but-unexecuted marking
+    /// packets (ENQUEUED − TRACED) plus SATB records not yet turned into
+    /// packets (SATB_ENQ − SATB_RUN, net of the pre-cycle drift).
+    pub(super) fn mark_backlog_objects(&self) -> usize {
+        use crate::plan::concurrent::diag::{ENQUEUED, SATB_ENQ, SATB_RUN, TRACED};
+        let parked = ENQUEUED
+            .load(Ordering::Relaxed)
+            .saturating_sub(TRACED.load(Ordering::Relaxed));
+        let satb = SATB_ENQ
+            .load(Ordering::Relaxed)
+            .saturating_sub(SATB_RUN.load(Ordering::Relaxed))
+            .saturating_sub(self.satb_drift_at_cycle_start.load(Ordering::Relaxed) as usize);
+        parked + satb
+    }
+
+    /// Projection-guard bookkeeping shared by both quanta (Release stage:
+    /// this pause's promotions are in, nothing swept yet): fold this pause's
+    /// promotion into the EWMA and return (promotion_ewma_pages, runway_pages).
+    pub(super) fn sample_promotion(&self) -> (u64, u64) {
+        let now = self.get_mature_reserved_pages() as u64;
+        let promoted = now.saturating_sub(self.mature_at_prepare.load(Ordering::Relaxed));
+        let prev = self.promotion_ewma_pages.load(Ordering::Relaxed);
+        let next = if prev == 0 { promoted } else { prev - prev / 4 + promoted / 4 };
+        self.promotion_ewma_pages.store(next, Ordering::Relaxed);
+        (next, self.runway_pages() as u64)
+    }
+
+    pub(super) fn note_mark_slice(&self, net: u64) -> (u64, u64) {
+        let prev = self.mark_net_ewma.load(Ordering::Relaxed);
+        let next = if prev == 0 { net } else { prev - prev / 4 + net / 4 };
+        self.mark_net_ewma.store(next, Ordering::Relaxed);
+        (next, self.mark_slices_this_cycle.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    pub(super) fn note_sweep_slice(&self, packets: u64) -> (u64, u64) {
+        let prev = self.sweep_packets_ewma_x256.load(Ordering::Relaxed);
+        let next = if prev == 0 { packets * 256 } else { prev - prev / 4 + packets * 64 };
+        self.sweep_packets_ewma_x256.store(next, Ordering::Relaxed);
+        (next, self.sweep_slices_this_cycle.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    pub(super) fn request_escalate_mark(&self) {
+        self.escalate_mark.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn request_escalate_sweep(&self) {
+        self.escalate_sweep.store(true, Ordering::SeqCst);
+    }
+
     /// Called by the sweep quantum when it drains the queue empty. Guarded:
     /// only the true->false TRANSITION performs completion actions, so a
     /// quantum that raced ahead of the parking (empty pop, pending still
@@ -1010,6 +1136,16 @@ impl<VM: VMBinding> Bactrian<VM> {
             mark_debt_nanos: AtomicU64::new(0),
             nursery_pause_ewma_nanos: AtomicU64::new(0),
             pause_start_nanos: AtomicU64::new(0),
+            enqueued_at_last_quantum: AtomicU64::new(0),
+            mature_at_prepare: AtomicU64::new(0),
+            promotion_ewma_pages: AtomicU64::new(0),
+            mark_net_ewma: AtomicU64::new(0),
+            mark_slices_this_cycle: AtomicU64::new(0),
+            satb_drift_at_cycle_start: AtomicU64::new(0),
+            sweep_packets_ewma_x256: AtomicU64::new(0),
+            sweep_slices_this_cycle: AtomicU64::new(0),
+            escalate_mark: AtomicBool::new(false),
+            escalate_sweep: AtomicBool::new(false),
             compact_requested: AtomicBool::new(false),
             previous_pause: Atomic::new(None),
             concurrent_marking_active: AtomicBool::new(false),
