@@ -30,8 +30,10 @@ pub fn test_allocator_info() {
                 | PlanSelector::MarkCompact
                 | PlanSelector::Compressor
                 | PlanSelector::ConcurrentImmix
-                | PlanSelector::StickyImmix => {
-                    // These plans all use bump pointer allocator.
+                | PlanSelector::StickyImmix
+                | PlanSelector::Bactrian
+                | PlanSelector::LXR => {
+                    // These plans all use a bump-pointer (or Immix, which embeds one) allocator.
                     let AllocatorInfo::BumpPointer {
                         bump_pointer_offset,
                     } = allocator_info
