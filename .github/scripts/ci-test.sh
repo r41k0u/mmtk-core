@@ -16,6 +16,15 @@ ALL_PLANS=$(sed -n '/enum PlanSelector/,/}/p' src/util/options.rs | sed -e 's;//
 # At the moment, the Compressor does not work with the mock VM tests.
 # So we skip testing the Compressor entirely.
 ALL_PLANS=$(echo -n "$ALL_PLANS" | sed '/Compressor/d')
+# LXR requires side mark bits (its Immix block code extracts the side spec);
+# MockVM keeps the mark bit in the header, so LXR cannot run under it.
+ALL_PLANS=$(echo -n "$ALL_PLANS" | sed '/LXR/d')
+
+# The mock tests were written for the 32KB bump-allocator granule and a 1MB
+# fixture heap; the fork's measured default is 512KB (see bumpallocator.rs),
+# whose first block plus its copy reserve already exceeds that heap. Pin the
+# granule for the mock tests only.
+export MMTK_BUMP_BLOCK_KB=32
 
 # Test with mock VM:
 # - Find all the files that start with mock_test_
