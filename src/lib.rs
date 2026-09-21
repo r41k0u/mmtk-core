@@ -68,6 +68,7 @@ pub use crate::plan::{
 // `SweepBlocksAfterDecs` signatures that take/clone it compile unchanged. It performs no
 // callback on drop. When lazy decrements are wired (deferred), restore the reference's Drop +
 // `LazySweepingJobs` registry.
+/// Counter handles for LXR's lazy sweeping jobs (see `LazySweepingJobs`).
 #[allow(dead_code)]
 pub struct LazySweepingJobsCounter {
     decs_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,

@@ -465,7 +465,7 @@ impl<VM: VMBinding> LXR<VM> {
     /// dropped now). The minimal cut runs decs stop-the-world in `STWRCDecsAndSweep` (lazy decrements
     /// are deferred). Always schedules at least one (possibly empty) packet so the bucket opens.
     fn process_prev_roots(&self, scheduler: &GCWorkScheduler<VM>) {
-        let prev_roots = self.prev_roots.write().unwrap();
+        let prev_roots = self.prev_roots.read().unwrap();
         if super::rc::rc_debug_on() {
             let n_pkts = prev_roots.len();
             // SegQueue::len is O(1); count total root targets across packets non-destructively is
@@ -596,6 +596,7 @@ impl<VM: VMBinding> LXR<VM> {
     ///   - `prepare_rc(Full)` sets `is_end_of_satb_or_full_gc` so liveness consults the mark bit;
     ///   - after the closure + decs drain, `RCBlockSweepEpilogue` runs the nursery + mature sweeps
     ///     and (for Full) the `SweepDeadCycles` dead-cycle sweep, then bumps the epoch.
+    ///
     /// No concurrent marking, no copying — pure STW, matching the in-place cut.
     fn schedule_full_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
         self.disable_unnecessary_buckets(scheduler, Pause::Full);

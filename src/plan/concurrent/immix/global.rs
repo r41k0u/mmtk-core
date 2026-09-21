@@ -45,8 +45,10 @@ pub struct ConcurrentImmix<VM: VMBinding> {
     #[post_scan]
     #[space]
     #[copy_semantics(CopySemantics::DefaultCopy)]
+    /// The Immix space that holds all objects.
     pub immix_space: ImmixSpace<VM>,
     #[parent]
+    /// The common spaces (immortal, large-object, non-moving, VM spaces).
     pub common: CommonPlan<VM>,
     last_gc_was_defrag: AtomicBool,
     current_pause: Atomic<Option<Pause>>,
@@ -298,6 +300,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
 }
 
 impl<VM: VMBinding> ConcurrentImmix<VM> {
+    /// Create the plan and its spaces.
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
         let spec = crate::util::metadata::extract_side_metadata(&[
             *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC,
@@ -414,6 +417,7 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
             .set_sentinel(Box::new(VMProcessWeakRefs::<RefProcessingEdges<VM>>::new()));
     }
 
+    /// Is a concurrent marking cycle in flight (between InitialMark and FinalMark)?
     pub fn concurrent_marking_in_progress(&self) -> bool {
         self.concurrent_marking_active.load(Ordering::Acquire)
     }

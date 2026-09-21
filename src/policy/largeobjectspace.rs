@@ -355,7 +355,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
     /// Scope full-heap marking semantics over a mid-cycle marking drain (see
     /// the `in_nursery_gc` doc). Returns the previous value; caller restores.
     pub fn set_marking_full_semantics(&self, on: bool) -> bool {
-        self.in_nursery_gc.swap(!on, Ordering::SeqCst) == false
+        !self.in_nursery_gc.swap(!on, Ordering::SeqCst)
     }
 
     pub fn prepare(&mut self, full_heap: bool) {

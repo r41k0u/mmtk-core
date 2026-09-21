@@ -431,8 +431,10 @@ impl WorkBucketStage {
     // associated-const aliases so LXR gc_work (P3) can name them. `RCProcessIncs` reuses the
     // appended `Initial` stage; `RCEvacuateMature` reuses the existing `Closure` stage (RC
     // mature evacuation runs as part of the closure).
+    /// LXR: the stage that processes reference-count increments (the `Initial` stage).
     #[allow(non_upper_case_globals)]
     pub const RCProcessIncs: Self = Self::Initial;
+    /// LXR: the stage that evacuates mature objects (part of the `Closure` stage).
     #[allow(non_upper_case_globals)]
     pub const RCEvacuateMature: Self = Self::Closure;
 }

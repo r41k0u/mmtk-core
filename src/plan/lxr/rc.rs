@@ -108,7 +108,7 @@ fn fake_tls() -> VMThread {
 /// in-space heap object. If not, print the bogus reference + the call site and abort cleanly
 /// (instead of a raw SIGSEGV deep in `atomic_load`), so the offending path is pinpointed.
 #[inline(always)]
-fn debug_rc_validate<VM: VMBinding>(site: &str, o: ObjectReference) {
+fn debug_rc_validate(site: &str, o: ObjectReference) {
     if !cfg!(debug_assertions) && std::env::var_os("MMTK_RC_DEBUG").is_none() {
         return;
     }
@@ -235,7 +235,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             let Some(target) = slot.load() else {
                 return;
             };
-            debug_rc_validate::<VM>("scan_nursery_object.field", target);
+            debug_rc_validate("scan_nursery_object.field", target);
             let rc = self.rc.count(target);
             if rc == 0 {
                 // Fresh nursery child — defer a recursive increment (it will itself promote).
@@ -253,7 +253,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
 
     /// The minimal in-place-promotion inc: increment, and promote on the 0 → 1 transition.
     fn process_inc(&mut self, o: ObjectReference) {
-        debug_rc_validate::<VM>("process_inc", o);
+        debug_rc_validate("process_inc", o);
         // Validate `o` is a real heap object in some MMTk space BEFORE indexing its per-object
         // RC_TABLE metadata. `inc` -> RC_TABLE.fetch_update_atomic(o.to_raw_address()) does NO
         // mapped-address check, so a garbage ObjectReference faults on the metadata atomic. Under
@@ -593,6 +593,7 @@ impl<VM: VMBinding> DerefMut for RCImmixCollectRootEdges<VM> {
 ///     that already ran its root scan, so it never promotes the result, and
 ///   * the `term_sync.state` field-barrier increment is buffered but the terminating mutator's
 ///     barrier buffer is dropped un-flushed at deregister.
+///
 /// So the result's clean nursery block (`BlockState::Unallocated`, all-RC-zero) is reclaimed by
 /// `sweep_nursery_blocks` and reused before the joiner dereferences `term_sync.state` -- SIGSEGV
 /// in `Domain.join` (rr-confirmed).

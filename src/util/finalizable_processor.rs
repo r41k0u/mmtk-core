@@ -69,7 +69,7 @@ impl<F: Finalizable> FinalizableProcessor<F> {
         for mut f in self.candidates.drain(start..).collect::<Vec<F>>() {
             let reff = f.get_reference();
             trace!("Pop {:?} for finalization", reff);
-            if nursery && young.map_or(false, |is_young| !is_young(reff)) {
+            if nursery && young.is_some_and(|is_young| !is_young(reff)) {
                 // Aging minor, mature candidate: untraced this GC — keep.
                 self.candidates.push(f);
                 continue;
@@ -187,11 +187,11 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for Finalization<E> {
             && mmtk
                 .get_plan()
                 .generational()
-                .map_or(false, |g| g.nursery_keeps_movable_survivors());
+                .is_some_and(|g| g.nursery_keeps_movable_survivors());
         let is_young = |o: crate::util::ObjectReference| {
             mmtk.get_plan()
                 .generational()
-                .map_or(false, |g| g.is_object_in_nursery(o))
+                .is_some_and(|g| g.is_object_in_nursery(o))
         };
         finalizable_processor.scan(
             worker.tls,

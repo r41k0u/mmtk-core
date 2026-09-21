@@ -64,7 +64,7 @@ pub fn is_alloc_zeroed() -> bool {
 /// only while a generational plan is performing a nursery collection. The
 /// underlying flag is set at GC prepare time and valid throughout the GC, so this is
 /// safe to consult from `Scanning::process_weak_refs`. This re-exports the
-/// otherwise module-sealed [`crate::plan::is_nursery_gc`] so a binding can make its
+/// otherwise module-sealed `crate::plan::is_nursery_gc` so a binding can make its
 /// weak / ephemeron / finaliser liveness pass generational-aware: at a nursery GC a
 /// mature (or freshly promoted) referent has no current mark bit and must be treated
 /// as live rather than cleared.
@@ -78,7 +78,7 @@ pub fn current_gc_is_nursery<VM: VMBinding>(mmtk: &MMTK<VM>) -> bool {
 /// has been promoted out of the nursery. For plans where young and mature share a
 /// space and are distinguished only by per-object metadata (StickyImmix) this uses
 /// that metadata; where address-based membership is unavailable it errs toward
-/// `false` (mature) — see [`crate::plan::generational::global::GenerationalPlan`].
+/// `false` (mature) — see `GenerationalPlan::is_object_in_nursery`.
 pub fn is_object_in_nursery<VM: VMBinding>(mmtk: &MMTK<VM>, object: ObjectReference) -> bool {
     mmtk.get_plan()
         .generational()

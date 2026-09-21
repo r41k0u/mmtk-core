@@ -386,11 +386,11 @@ impl Block {
 
     // ── RC per-block side-table operations ─────────────────────────────────────
 
-    pub fn clear_rc_table<VM: VMBinding>(&self) {
+    pub fn clear_rc_table(&self) {
         crate::util::rc::RC_TABLE.bzero_metadata(self.start(), Block::BYTES);
     }
 
-    pub fn clear_striddle_table<VM: VMBinding>(&self) {
+    pub fn clear_striddle_table(&self) {
         crate::util::rc::RC_STRADDLE_LINES.bzero_metadata(self.start(), Block::BYTES);
     }
 
@@ -435,11 +435,13 @@ impl Block {
         type UInt = u128;
         const LOG_BITS_IN_UINT: usize =
             (std::mem::size_of::<UInt>() << 3).trailing_zeros() as usize;
-        debug_assert!(
-            Self::LOG_BYTES - crate::util::rc::LOG_MIN_OBJECT_SIZE
-                + crate::util::rc::LOG_REF_COUNT_BITS
-                >= LOG_BITS_IN_UINT
-        );
+        const {
+            assert!(
+                Self::LOG_BYTES - crate::util::rc::LOG_MIN_OBJECT_SIZE
+                    + crate::util::rc::LOG_REF_COUNT_BITS
+                    >= LOG_BITS_IN_UINT
+            )
+        };
         let start = crate::util::metadata::side_metadata::address_to_meta_address(
             &crate::util::rc::RC_TABLE,
             self.start(),

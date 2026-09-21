@@ -5,6 +5,8 @@
 //! **purely additive scaffolding** (P1): nothing here is wired into any existing plan's behaviour.
 //! The values are only consumed once the `MMTK_PLAN=LXR` plan + its gc_work land (P3).
 //!
+#![allow(missing_docs)] // vendored LXR knobs; documented upstream
+//!
 //! ## Adaptation notes (LXR `lxr/lxr` @ +1690 commits  vs  our 0.32.0)
 //!
 //! * LXR stored `RuntimeArgs` in a `static mut MaybeUninit<RuntimeArgs>` requiring an explicit
@@ -179,9 +181,8 @@ pub const LOG_BYTES_PER_RC_LOCK_BIT: usize = {
         7
     } else if cfg!(feature = "lxr_lock_8") {
         8
-    } else if cfg!(feature = "lxr_lock_9") {
-        9
     } else {
+        // lxr_lock_9 and the default agree.
         9
     }
 };

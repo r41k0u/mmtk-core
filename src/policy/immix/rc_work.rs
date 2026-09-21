@@ -115,7 +115,7 @@ impl<VM: VMBinding> GCWork<VM> for ChunkMarkZeroing {
         let num_chunks = (self.chunks.end.start() - self.chunks.start.start()) >> Chunk::LOG_BYTES;
         for i in 0..num_chunks {
             let chunk = self.chunks.start.next_nth(i);
-            if !ix.chunk_map.get(chunk).is_some() {
+            if ix.chunk_map.get(chunk).is_none() {
                 continue;
             }
             Self::reset_object_mark::<VM>(chunk);
@@ -168,10 +168,12 @@ impl<VM: VMBinding> SweepDeadCycles<VM> {
                 // rc>0 but unreachable => dead cyclic garbage. Skip straddle CONTINUATION cells
                 // (a >1-line object's continuation lines carry an rc==1 straddle marker, not a real
                 // object header): only the object START is a real object.
-                if !crate::args::BLOCK_ONLY && o.to_raw_address().is_aligned_to(Line::BYTES) {
-                    if c == 1 && self.rc.is_straddle_line(Line::of(o.to_raw_address())) {
-                        continue;
-                    }
+                if !crate::args::BLOCK_ONLY
+                    && o.to_raw_address().is_aligned_to(Line::BYTES)
+                    && c == 1
+                    && self.rc.is_straddle_line(Line::of(o.to_raw_address()))
+                {
+                    continue;
                 }
                 self.process_dead_object(o);
             } else if c != 0 {
@@ -190,7 +192,7 @@ impl<VM: VMBinding> GCWork<VM> for SweepDeadCycles<VM> {
         let num_chunks = (self.chunks.end.start() - self.chunks.start.start()) >> Chunk::LOG_BYTES;
         for i in 0..num_chunks {
             let chunk = self.chunks.start.next_nth(i);
-            if !immix_space.chunk_map.get(chunk).is_some() {
+            if immix_space.chunk_map.get(chunk).is_none() {
                 continue;
             }
             for block in chunk

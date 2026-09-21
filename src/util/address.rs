@@ -360,6 +360,7 @@ impl Address {
     // hardcodes 64 heap-bytes/unlog-byte (OCaml has no compressed pointers, so the LXR
     // `COMPRESSED_PTR_ENABLED` branch is always the 64 case).
 
+    /// LXR field logging: is the field at this address logged (its unlog bit clear)?
     pub fn is_field_logged<VM: VMBinding>(self) -> bool {
         use crate::vm::ObjectModel;
         debug_assert!(!self.is_zero());
@@ -372,6 +373,7 @@ impl Address {
         }
     }
 
+    /// LXR field logging: atomically log the field; true if this call logged it.
     pub fn attempt_log_field<VM: VMBinding>(self) -> bool {
         use crate::vm::ObjectModel;
         debug_assert!(!self.is_zero());
@@ -398,6 +400,7 @@ impl Address {
         }
     }
 
+    /// LXR field logging: mark the field logged.
     pub fn log_field<VM: VMBinding>(self) {
         use crate::vm::ObjectModel;
         debug_assert!(!self.is_zero());
@@ -407,6 +410,7 @@ impl Address {
             .store_atomic(self, crate::plan::barriers::LOGGED_VALUE, Ordering::Relaxed)
     }
 
+    /// LXR field logging: mark the field unlogged (sequentially consistent).
     pub fn unlog_field<VM: VMBinding>(self) {
         use crate::vm::ObjectModel;
         debug_assert!(!self.is_zero());
@@ -420,6 +424,7 @@ impl Address {
             )
     }
 
+    /// LXR field logging: mark the field unlogged with relaxed ordering.
     pub fn unlog_field_relaxed<VM: VMBinding>(self) {
         use crate::vm::ObjectModel;
         debug_assert!(!self.is_zero());

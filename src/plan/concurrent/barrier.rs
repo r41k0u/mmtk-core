@@ -15,6 +15,9 @@ use crate::{
     MMTK,
 };
 
+/// Snapshot-at-the-beginning deletion barrier: records the old value of every
+/// overwritten reference while a marking cycle is open so the snapshot stays
+/// complete, and hands the recorded values to the marking work as packets.
 pub struct SATBBarrierSemantics<
     VM: VMBinding,
     P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>,
@@ -30,6 +33,7 @@ pub struct SATBBarrierSemantics<
 impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND: TraceKind>
     SATBBarrierSemantics<VM, P, KIND>
 {
+    /// Barrier semantics for one mutator thread.
     pub fn new(mmtk: &'static MMTK<VM>, tls: VMMutatorThread) -> Self {
         Self {
             mmtk,

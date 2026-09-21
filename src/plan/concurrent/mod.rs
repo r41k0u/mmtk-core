@@ -1,4 +1,5 @@
 pub mod bactrian;
+/// SATB (snapshot-at-the-beginning) barrier semantics shared by the concurrent plans.
 pub mod barrier;
 pub(super) mod concurrent_marking_work;
 pub(super) mod global;

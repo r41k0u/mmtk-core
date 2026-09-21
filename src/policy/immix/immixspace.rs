@@ -917,13 +917,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         unlog_bits_op: UnlogBitsOperation,
     ) -> Vec<Box<dyn GCWork<VM>>> {
         debug_assert!(!self.rc_enabled);
-        if major_gc {
-            if !super::BLOCK_ONLY {
-                self.line_unavail_state.store(
-                    self.line_mark_state.load(Ordering::Acquire),
-                    Ordering::Release,
-                );
-            }
+        if major_gc && !super::BLOCK_ONLY {
+            self.line_unavail_state.store(
+                self.line_mark_state.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         }
         if !super::BLOCK_ONLY {
             self.reusable_blocks.reset();

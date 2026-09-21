@@ -553,8 +553,8 @@ impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
                     <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut collector);
                 }
                 self.plan.post_scan_object(object);
-                for i in 0..scratch.len() {
-                    self.process_slot(scratch[i]);
+                for slot in scratch.iter().copied() {
+                    self.process_slot(slot);
                 }
                 scratch.clear();
             }

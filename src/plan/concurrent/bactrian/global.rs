@@ -71,6 +71,7 @@ pub struct Bactrian<VM: VMBinding> {
     pub aged0: CopySpace<VM>,
     #[space]
     #[copy_semantics(CopySemantics::PromoteToMature)]
+    /// Second half of the aged-survivor pair (see `aged0`).
     pub aged1: CopySpace<VM>,
     /// Which aged space is the current to-space (mirrors GenCopy's `hi`).
     aged_hi: AtomicBool,
@@ -1218,10 +1219,6 @@ impl<VM: VMBinding> Bactrian<VM> {
         )
     }
 
-    pub(super) fn request_escalate_mark(&self) {
-        self.escalate_mark.store(true, Ordering::SeqCst);
-    }
-
     pub(super) fn request_escalate_sweep(&self) {
         self.escalate_sweep.store(true, Ordering::SeqCst);
     }
@@ -1283,6 +1280,7 @@ impl<VM: VMBinding> Bactrian<VM> {
         }
     }
 
+    /// Create the plan and its spaces.
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
@@ -1374,6 +1372,7 @@ impl<VM: VMBinding> Bactrian<VM> {
 
     /// Decide what kind of pause this collection is. Called once per collection from
     /// `schedule_collection`, with mutators about to be (or being) stopped.
+    #[allow(clippy::if_same_then_else)] // several distinct reasons resolve to Pause::Full
     fn decide_pause(&self) -> Pause {
         if self.concurrent_marking_in_progress() {
             // While a cycle is in flight the only legal pauses are Nursery and
@@ -1579,6 +1578,7 @@ impl<VM: VMBinding> Bactrian<VM> {
         }
     }
 
+    /// Is a marking cycle in flight (between InitialMark and FinalMark)?
     pub fn concurrent_marking_in_progress(&self) -> bool {
         self.concurrent_marking_active.load(Ordering::Acquire)
     }

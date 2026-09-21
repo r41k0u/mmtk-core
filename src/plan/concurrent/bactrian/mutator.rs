@@ -115,7 +115,7 @@ pub fn bactrian_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, _tls: 
 /// Max_young_wosize pretenuring — blocks above the boundary are born in the
 /// major heap (never transiting the minor heap), exactly as
 /// shared_heap.c:504/515 does via pools/malloc. The runtime routes the
-/// >=2056B band here under MMTK_MEDIUM_NONMOVING (see caml_mmtk_semantics).
+/// band of 2056 B and larger here under MMTK_MEDIUM_NONMOVING (see caml_mmtk_semantics).
 /// Born-mature objects are unlogged at birth (binding, post-alloc) so the
 /// generational barrier remembers their young stores; during concurrent
 /// marking the ImmixAllocator's allocate-as-live path keeps them from the
