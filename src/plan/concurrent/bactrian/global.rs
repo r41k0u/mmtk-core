@@ -121,6 +121,16 @@ pub struct Bactrian<VM: VMBinding> {
     /// pauses that stay small at any nursery cap, so the feasibility
     /// escape's nursery gate must not degrade them to monolithic Fulls.
     cycle_tick_origin: AtomicBool,
+    /// Estimated monolithic-Full mark time in nanoseconds (live / mark-rate),
+    /// stored beside the quantum hint; the slicing gate slices only when this
+    /// exceeds MMTK_SLICE_WORTH_MS (a short Full is not worth slicing).
+    mark_debt_nanos: AtomicU64,
+    /// EWMA (alpha 1/4) of recent nursery-pause wall time in nanoseconds; the
+    /// slicing gate adds the quantum to it to estimate the sliced pause and
+    /// checks it against MMTK_SLICE_MAX_PAUSE_MS. 0 = no sample yet.
+    nursery_pause_ewma_nanos: AtomicU64,
+    /// now_nanos() at the current pause's prepare(), for the EWMA above.
+    pause_start_nanos: AtomicU64,
     /// Pending mature-compaction request (ConcurrentPlan::
     /// request_mature_compaction — the binding's reserved-vs-live runaway
     /// law). Consumed by decide_pause: rides the next major as a COMPACT-ALL
@@ -319,6 +329,7 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
 
     fn prepare(&mut self, tls: VMWorkerThread) {
         let pause = self.current_pause().unwrap();
+        self.pause_start_nanos.store(now_nanos(), Ordering::Relaxed);
         match pause {
             Pause::Full => {
                 // GenImmix's full-heap protocol: bulk-clear unlog bits; the full trace
@@ -484,6 +495,15 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
 
     fn end_of_gc(&mut self, tls: VMWorkerThread) {
         let pause = self.current_pause().unwrap();
+        if matches!(pause, Pause::Nursery) {
+            let start = self.pause_start_nanos.load(Ordering::Relaxed);
+            if start != 0 {
+                let dur = now_nanos().saturating_sub(start);
+                let prev = self.nursery_pause_ewma_nanos.load(Ordering::Relaxed);
+                let next = if prev == 0 { dur } else { prev - prev / 4 + dur / 4 };
+                self.nursery_pause_ewma_nanos.store(next, Ordering::Relaxed);
+            }
+        }
 
         let next_gc_full_heap = CommonGenPlan::should_next_gc_be_full_heap(self);
         self.gen.end_of_gc(tls, next_gc_full_heap);
@@ -774,9 +794,13 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
         ))
     }
 
-    fn set_mark_quantum_hint_ms(&self, ms: f64, tick_origin: bool) {
+    fn set_mark_quantum_hint_ms(&self, ms: f64, debt_ms: f64, tick_origin: bool) {
         let ns = (ms.max(0.0) * 1e6) as u64;
         self.mark_quantum_hint_nanos.store(ns, Ordering::Relaxed);
+        // debt_ms = live / mark-rate = the estimated monolithic-Full mark time,
+        // read by the slicing gate as the "is a Full too long?" quantity.
+        self.mark_debt_nanos
+            .store((debt_ms.max(0.0) * 1e6) as u64, Ordering::Relaxed);
         self.cycle_tick_origin.store(tick_origin, Ordering::Relaxed);
     }
 
@@ -983,6 +1007,9 @@ impl<VM: VMBinding> Bactrian<VM> {
             progress_pause_requested: AtomicBool::new(false),
             mark_quantum_hint_nanos: AtomicU64::new(0),
             cycle_tick_origin: AtomicBool::new(false),
+            mark_debt_nanos: AtomicU64::new(0),
+            nursery_pause_ewma_nanos: AtomicU64::new(0),
+            pause_start_nanos: AtomicU64::new(0),
             compact_requested: AtomicBool::new(false),
             previous_pause: Atomic::new(None),
             concurrent_marking_active: AtomicBool::new(false),
@@ -1057,30 +1084,39 @@ impl<VM: VMBinding> Bactrian<VM> {
                 if std::env::var_os("BACTRIAN_NO_CONCURRENT").is_some() {
                     Pause::Full
                 } else if self.sliced_marking && {
-                    // Slicing is only worth running when it can make pauses
-                    // small. Otherwise a monolithic Full has the same
-                    // worst-case pause and costs less total GC time
-                    // (bt-def@192M: 2663ms as Fulls vs 3181ms sliced,
-                    // ~103-138ms max pause either way). Two checks:
-                    //  - nursery size (MMTK_SLICE_MAX_NURSERY_MB, default 4):
-                    //    with a big nursery, the minor pause alone is already
-                    //    tens of milliseconds, so slicing cannot make pauses
-                    //    small. Tick-origin cycles are exempt below: their
-                    //    pauses are near-empty minors, small at any nursery
-                    //    size.
-                    //  - the slice-sizing hint (MMTK_MAX_QUANTUM_MS, default
-                    //    50): if each slice would need more than this much
-                    //    marking time, the runway cannot be covered by small
-                    //    pauses at all.
-                    let nursery_big = self.gen.common.base.gc_trigger.get_max_nursery_pages()
-                        > slice_max_nursery_pages();
-                    // Tick-origin cycles (mature-direct pacing) progress in
-                    // near-empty nursery pauses — small at any nursery cap —
-                    // so the nursery gate does not apply to them.
+                    // Slice a cycle only when BOTH hold; else run one monolithic
+                    // Full. (Replaces the old nursery-size + max-quantum gates.)
+                    //  WORTH: the monolithic Full would be too long. debt_ms
+                    //   (live / mark-rate) is its estimated mark time; under
+                    //   MMTK_SLICE_WORTH_MS the Full is short, so slicing buys no
+                    //   worst-case-pause win and only costs throughput
+                    //   (bt-def@192M: 2663ms Full vs 3181ms sliced, ~103-138ms
+                    //   max pause either way) — don't slice.
+                    //  FEASIBLE: the sliced pause fits the target. Estimate is
+                    //   the recent nursery-pause EWMA + this cycle's quantum;
+                    //   above MMTK_SLICE_MAX_PAUSE_MS slicing cannot keep pauses
+                    //   small (the intent of the old nursery/quantum gates).
+                    // Tick-origin cycles (mature-direct pacing) run in near-empty
+                    // minors and always slice.
                     let tick_origin = self.cycle_tick_origin.load(Ordering::Relaxed);
-                    let hint_ms =
+                    let debt_ms =
+                        self.mark_debt_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+                    let quantum_ms =
                         self.mark_quantum_hint_nanos.load(Ordering::Relaxed) as f64 / 1e6;
-                    (nursery_big && !tick_origin) || hint_ms > max_quantum_ms()
+                    let minor_ms =
+                        self.nursery_pause_ewma_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+                    let worth = debt_ms > slice_worth_ms();
+                    let feasible = minor_ms + quantum_ms <= slice_max_pause_ms();
+                    // true => monolithic Full instead of slicing.
+                    let monolithic = !tick_origin && (!worth || !feasible);
+                    if std::env::var_os("MMTK_PACE_DEBUG").is_some() {
+                        eprintln!(
+                            "[pace] slice gate: debt={:.0}ms quantum={:.1}ms minor_ewma={:.1}ms tick={} worth={} feasible={} -> {}",
+                            debt_ms, quantum_ms, minor_ms, tick_origin, worth, feasible,
+                            if monolithic { "Full" } else { "sliced" }
+                        );
+                    }
+                    monolithic
                 } {
                     Pause::Full
                 } else if !self.sliced_marking
@@ -1246,34 +1282,38 @@ fn nursery_age() -> usize {
     })
 }
 
-/// Largest nursery for which sliced major cycles pay (pages;
-/// MMTK_SLICE_MAX_NURSERY_MB overrides, default 4MB — see the feasibility
-/// escape in decide_pause). Above it, minor pauses are promotion-bound and
-/// already dwarf any quantum, so majors run monolithic.
-fn slice_max_nursery_pages() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// Monolithic-Full estimate (debt_ms = live / mark-rate) below which slicing
+/// is not worth its throughput cost — a short Full has the same worst-case
+/// pause as the minors around it. MMTK_SLICE_WORTH_MS overrides, default 200.
+fn slice_worth_ms() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        let mb = std::env::var("MMTK_SLICE_MAX_NURSERY_MB")
+        std::env::var("MMTK_SLICE_WORTH_MS")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|m| *m > 0)
-            .unwrap_or(4);
-        mb * 1024 * 1024 / crate::util::constants::BYTES_IN_PAGE
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|ms| *ms >= 0.0)
+            .unwrap_or(200.0)
     })
 }
 
-/// Largest per-pause mark quantum worth slicing for, ms
-/// (MMTK_MAX_QUANTUM_MS overrides; see the feasibility escape in
-/// decide_pause). Above this the monolithic Full wins on both axes.
-fn max_quantum_ms() -> f64 {
+/// Latency target for the sliced pause (nursery-pause EWMA + this cycle's
+/// quantum); above it, slicing cannot keep pauses small, so run a monolithic
+/// Full. MMTK_SLICE_MAX_PAUSE_MS overrides, default 100.
+fn slice_max_pause_ms() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("MMTK_MAX_QUANTUM_MS")
+        std::env::var("MMTK_SLICE_MAX_PAUSE_MS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|ms| *ms > 0.0)
-            .unwrap_or(50.0)
+            .unwrap_or(100.0)
     })
+}
+
+/// Monotonic nanoseconds since first use, for the nursery-pause EWMA.
+fn now_nanos() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
 }
 
 /// Mature-size floor (in pages) below which a requested major cycle runs as a

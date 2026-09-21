@@ -121,7 +121,7 @@ pub trait ConcurrentPlan: Plan {
     /// batches — near-empty nursery collections that stay small at ANY
     /// nursery cap, so the nursery gate must not apply; fragmed flipped from
     /// cycles to 11 monolithic Fulls, D1 3.4→5.0×, when it did).
-    fn set_mark_quantum_hint_ms(&self, _ms: f64, _tick_origin: bool) {}
+    fn set_mark_quantum_hint_ms(&self, _ms: f64, _debt_ms: f64, _tick_origin: bool) {}
 
     /// Did the pause that JUST ENDED start a marking cycle (`InitialMark`, or
     /// a full STW GC — which is a whole cycle in one pause)? For
