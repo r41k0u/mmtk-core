@@ -131,6 +131,13 @@ pub struct Bactrian<VM: VMBinding> {
     /// also sweeps everything reserved and pays fixed per-pause work (eio:
     /// estimate 80-180 ms, measured Fulls 0.4-1.8 s). 0 = no Full yet.
     full_pause_ewma_nanos: AtomicU64,
+    /// Mature reserved pages when the Full EWMA and the last sliced cycle's
+    /// live count were sampled; the gate scales those measurements by the
+    /// heap's growth since (a 99 ms Full at 300 MB predicts ~825 ms at
+    /// 2.5 GB), instead of trusting a stale small number (eio: "predicted
+    /// 189 ms", Full took 1.9 s; sedlex: 40 ms vs 772 ms).
+    reserved_at_last_full: AtomicU64,
+    reserved_at_last_cycle: AtomicU64,
     /// Nanoseconds spent in mark/sweep quanta during the current pause; the
     /// nursery-pause EWMA is taken NET of it, otherwise runway-sized slices
     /// inflate the very average the slicing gate and the latency start use
@@ -582,6 +589,10 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                     prev - prev / 4 + dur / 4
                 };
                 slot.store(next, Ordering::Relaxed);
+                if matches!(pause, Pause::Full) {
+                    self.reserved_at_last_full
+                        .store(self.get_mature_reserved_pages() as u64, Ordering::Relaxed);
+                }
             }
         }
 
@@ -642,6 +653,8 @@ impl<VM: VMBinding> Plan for Bactrian<VM> {
                 let traced = (crate::plan::concurrent::diag::TRACED.load(Ordering::Relaxed) as u64)
                     .saturating_sub(self.traced_at_cycle_start.load(Ordering::Relaxed));
                 self.last_cycle_traced_objs.store(traced, Ordering::Relaxed);
+                self.reserved_at_last_cycle
+                    .store(self.get_mature_reserved_pages() as u64, Ordering::Relaxed);
                 self.sweep_slices_this_cycle.store(0, Ordering::Relaxed);
                 // End the MARKING half of the cycle, but under INCREMENTAL
                 // SWEEP keep allocate-as-live armed until the deferred sweep
@@ -1326,6 +1339,8 @@ impl<VM: VMBinding> Bactrian<VM> {
             nursery_pause_ewma_nanos: AtomicU64::new(0),
             pause_start_nanos: AtomicU64::new(0),
             full_pause_ewma_nanos: AtomicU64::new(0),
+            reserved_at_last_full: AtomicU64::new(0),
+            reserved_at_last_cycle: AtomicU64::new(0),
             quanta_nanos_this_pause: AtomicU64::new(0),
             mark_rate_objs_per_ms_x256: AtomicU64::new(0),
             last_cycle_traced_objs: AtomicU64::new(0),
@@ -1434,17 +1449,24 @@ impl<VM: VMBinding> Bactrian<VM> {
                         // bootstrap only). Tick-origin cycles (mature-direct pacing) run in
                         // near-empty minors and always slice.
                         let tick_origin = self.cycle_tick_origin.load(Ordering::Relaxed);
-                        let full_ms =
-                            self.full_pause_ewma_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+                        let now_pages = self.get_mature_reserved_pages().max(1) as f64;
+                        let growth = |at: u64| {
+                            if at == 0 {
+                                1.0
+                            } else {
+                                (now_pages / at as f64).max(1.0)
+                            }
+                        };
+                        let full_ms = self.full_pause_ewma_nanos.load(Ordering::Relaxed) as f64
+                            / 1e6
+                            * growth(self.reserved_at_last_full.load(Ordering::Relaxed));
                         let objs = self.last_cycle_traced_objs.load(Ordering::Relaxed);
                         let rate = self.mark_rate_objs_per_ms_x256.load(Ordering::Relaxed);
                         let pred_ms = if objs > 0 && rate > 0 {
                             objs as f64 * 256.0 / rate as f64
+                                * growth(self.reserved_at_last_cycle.load(Ordering::Relaxed))
                         } else {
-                            (self.get_mature_reserved_pages()
-                                * crate::util::constants::BYTES_IN_PAGE)
-                                as f64
-                                / 1048576.0
+                            now_pages * crate::util::constants::BYTES_IN_PAGE as f64 / 1048576.0
                         };
                         let worth = full_ms > slice_worth_ms() || pred_ms > slice_worth_ms();
                         // true => monolithic Full instead of slicing.
