@@ -1462,11 +1462,20 @@ impl<VM: VMBinding> Bactrian<VM> {
                             * growth(self.reserved_at_last_full.load(Ordering::Relaxed));
                         let objs = self.last_cycle_traced_objs.load(Ordering::Relaxed);
                         let rate = self.mark_rate_objs_per_ms_x256.load(Ordering::Relaxed);
+                        // Mature bytes at 1 MB/ms is a floor, not just a bootstrap: the last
+                        // sliced cycle's traced count misses everything promoted black during
+                        // it, which on a monotonically growing live set (sedlex: back-to-back
+                        // tick-origin cycles) is most of the heap — "predicted 44 ms" for a
+                        // Full that took 865 ms.
+                        let mature_ms =
+                            now_pages * crate::util::constants::BYTES_IN_PAGE as f64 / 1048576.0;
                         let pred_ms = if objs > 0 && rate > 0 {
-                            objs as f64 * 256.0 / rate as f64
-                                * growth(self.reserved_at_last_cycle.load(Ordering::Relaxed))
+                            mature_ms.max(
+                                objs as f64 * 256.0 / rate as f64
+                                    * growth(self.reserved_at_last_cycle.load(Ordering::Relaxed)),
+                            )
                         } else {
-                            now_pages * crate::util::constants::BYTES_IN_PAGE as f64 / 1048576.0
+                            mature_ms
                         };
                         let worth = full_ms > slice_worth_ms() || pred_ms > slice_worth_ms();
                         // true => monolithic Full instead of slicing.
