@@ -187,20 +187,11 @@ fn mark_slice_budget() -> std::time::Duration {
 
 impl<VM: VMBinding> BactrianMarkQuantum<VM> {
     pub(in crate::plan) fn budgeted(plan: &'static Bactrian<VM>) -> Self {
-        // Per-cycle hint (ConcurrentPlan::set_mark_quantum_hint_ms — the
-        // binding's slice-sizing law: mark debt spread over the runway's
-        // pauses) overrides the static budget; 0 = never hinted.
-        let hint = plan
-            .mark_quantum_hint_nanos
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let budget = if hint > 0 {
-            std::time::Duration::from_nanos(hint)
-        } else {
-            mark_slice_budget()
-        };
+        // The time budget only tops up the work floors (inflow, then the
+        // runway share); MMTK_MARK_SLICE_MS, default 2 ms.
         Self {
             plan,
-            budget: Some(budget),
+            budget: Some(mark_slice_budget()),
         }
     }
     pub(in crate::plan) fn unbudgeted(plan: &'static Bactrian<VM>) -> Self {

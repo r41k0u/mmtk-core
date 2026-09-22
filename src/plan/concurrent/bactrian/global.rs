@@ -114,20 +114,11 @@ pub struct Bactrian<VM: VMBinding> {
     /// Set by request_progress_pause (mature-direct allocation wants the
     /// in-flight quanta to advance); consumed by collection_required.
     progress_pause_requested: AtomicBool,
-    /// Per-pause mark-quantum budget hint in nanoseconds, set by the
-    /// binding's pacing at cycle-trigger time (ConcurrentPlan::
-    /// set_mark_quantum_hint_ms — stock's slice-sizing law: mark debt over
-    /// runway pauses). 0 = use the static MMTK_MARK_SLICE_MS budget.
-    pub(in crate::plan) mark_quantum_hint_nanos: AtomicU64,
     /// Did the mature-direct allocation TICK fire the pending cycle (vs the
     /// post-minor path)? Tick-paced cycles progress in near-empty nursery
-    /// pauses that stay small at any nursery cap, so the feasibility
-    /// escape's nursery gate must not degrade them to monolithic Fulls.
+    /// pauses that stay small at any nursery cap, so the slicing gate must
+    /// not degrade them to monolithic Fulls.
     cycle_tick_origin: AtomicBool,
-    /// Estimated monolithic-Full mark time in nanoseconds (live / mark-rate),
-    /// stored beside the quantum hint; the slicing gate slices only when this
-    /// exceeds MMTK_SLICE_WORTH_MS (a short Full is not worth slicing).
-    mark_debt_nanos: AtomicU64,
     /// EWMA (alpha 1/4) of recent nursery-pause wall time in nanoseconds; the
     /// slicing gate adds the quantum to it to estimate the sliced pause and
     /// checks it against MMTK_SLICE_MAX_PAUSE_MS. 0 = no sample yet.
@@ -992,13 +983,7 @@ impl<VM: VMBinding> ConcurrentPlan for Bactrian<VM> {
         ))
     }
 
-    fn set_mark_quantum_hint_ms(&self, ms: f64, debt_ms: f64, tick_origin: bool) {
-        let ns = (ms.max(0.0) * 1e6) as u64;
-        self.mark_quantum_hint_nanos.store(ns, Ordering::Relaxed);
-        // debt_ms = live / mark-rate = the estimated monolithic-Full mark time,
-        // read by the slicing gate as the "is a Full too long?" quantity.
-        self.mark_debt_nanos
-            .store((debt_ms.max(0.0) * 1e6) as u64, Ordering::Relaxed);
+    fn set_cycle_tick_origin(&self, tick_origin: bool) {
         self.cycle_tick_origin.store(tick_origin, Ordering::Relaxed);
     }
 
@@ -1337,9 +1322,7 @@ impl<VM: VMBinding> Bactrian<VM> {
             parked_sweep: crossbeam::deque::Injector::new(),
             sweep_pending: AtomicBool::new(false),
             progress_pause_requested: AtomicBool::new(false),
-            mark_quantum_hint_nanos: AtomicU64::new(0),
             cycle_tick_origin: AtomicBool::new(false),
-            mark_debt_nanos: AtomicU64::new(0),
             nursery_pause_ewma_nanos: AtomicU64::new(0),
             pause_start_nanos: AtomicU64::new(0),
             full_pause_ewma_nanos: AtomicU64::new(0),
@@ -1436,51 +1419,45 @@ impl<VM: VMBinding> Bactrian<VM> {
                     Pause::Full
                 } else if self.sliced_marking
                     && {
-                        // Slice a cycle only when BOTH hold; else run one monolithic
-                        // Full. (Replaces the old nursery-size + max-quantum gates.)
-                        //  WORTH: the monolithic Full would be too long. debt_ms
-                        //   (live / mark-rate) is its estimated mark time; under
-                        //   MMTK_SLICE_WORTH_MS the Full is short, so slicing buys no
-                        //   worst-case-pause win and only costs throughput
-                        //   (bt-def@192M: 2663ms Full vs 3181ms sliced, ~103-138ms
-                        //   max pause either way) — don't slice.
-                        //  FEASIBLE: the sliced pause fits the target. Estimate is
-                        //   the recent nursery-pause EWMA + this cycle's quantum;
-                        //   above MMTK_SLICE_MAX_PAUSE_MS slicing cannot keep pauses
-                        //   small (the intent of the old nursery/quantum gates).
-                        // Tick-origin cycles (mature-direct pacing) run in near-empty
-                        // minors and always slice.
+                        // Slice a cycle iff the monolithic Full would be too long: under
+                        // MMTK_SLICE_WORTH_MS a Full is short, so slicing buys no
+                        // worst-case-pause win and only costs throughput (bt-def@192M:
+                        // 2663ms Full vs 3181ms sliced, ~103-138ms max pause either way).
+                        // With runway-paced, target-capped slices the sliced pause is
+                        // bounded by construction, so there is no feasibility test: what
+                        // slicing costs when the runway is short is bounded heap overshoot,
+                        // while a monolithic Full of a large live set costs seconds (ydump:
+                        // 14.5 s). The Full's cost is predicted from measurements, not from
+                        // a binding-side estimate: the EWMA of Fulls already run, or the
+                        // last sliced cycle's live object count at the measured mark rate;
+                        // before either exists, mature bytes at an assumed 1 MB/ms (a
+                        // bootstrap only). Tick-origin cycles (mature-direct pacing) run in
+                        // near-empty minors and always slice.
                         let tick_origin = self.cycle_tick_origin.load(Ordering::Relaxed);
-                        let debt_ms = self.mark_debt_nanos.load(Ordering::Relaxed) as f64 / 1e6;
-                        let quantum_ms =
-                            self.mark_quantum_hint_nanos.load(Ordering::Relaxed) as f64 / 1e6;
-                        let minor_ms =
-                            self.nursery_pause_ewma_nanos.load(Ordering::Relaxed) as f64 / 1e6;
                         let full_ms =
                             self.full_pause_ewma_nanos.load(Ordering::Relaxed) as f64 / 1e6;
-                        // Worth slicing if EITHER the estimate or the measured
-                        // Full duration exceeds the bar.
-                        let worth = debt_ms > slice_worth_ms() || full_ms > slice_worth_ms();
-                        // With runway-paced, target-capped slices the sliced pause is
-                        // bounded by construction; what slicing costs when the runway
-                        // is short is bounded heap overshoot, not pause time, while a
-                        // monolithic Full of a large live set costs seconds (ydump:
-                        // 14.5 s). The binding's quantum hint (debt over the live
-                        // limit's runway) is only informational now. Slice whenever
-                        // it is worth it; MMTK_SLICE_FEASIBLE=1 restores the old test.
-                        let feasible = if std::env::var_os("MMTK_SLICE_FEASIBLE").is_some() {
-                            minor_ms + quantum_ms <= slice_max_pause_ms()
+                        let objs = self.last_cycle_traced_objs.load(Ordering::Relaxed);
+                        let rate = self.mark_rate_objs_per_ms_x256.load(Ordering::Relaxed);
+                        let pred_ms = if objs > 0 && rate > 0 {
+                            objs as f64 * 256.0 / rate as f64
                         } else {
-                            true
+                            (self.get_mature_reserved_pages()
+                                * crate::util::constants::BYTES_IN_PAGE)
+                                as f64
+                                / 1048576.0
                         };
+                        let worth = full_ms > slice_worth_ms() || pred_ms > slice_worth_ms();
                         // true => monolithic Full instead of slicing.
-                        let monolithic = !tick_origin && (!worth || !feasible);
+                        let monolithic = !tick_origin && !worth;
                         if std::env::var_os("MMTK_PACE_DEBUG").is_some() {
                             eprintln!(
-                            "[pace] slice gate: debt={:.0}ms full_ewma={:.0}ms quantum={:.1}ms minor_ewma={:.1}ms tick={} worth={} feasible={} -> {}",
-                            debt_ms, full_ms, quantum_ms, minor_ms, tick_origin, worth, feasible,
-                            if monolithic { "Full" } else { "sliced" }
-                        );
+                                "[pace] slice gate: full_ewma={:.0}ms predicted={:.0}ms tick={} worth={} -> {}",
+                                full_ms,
+                                pred_ms,
+                                tick_origin,
+                                worth,
+                                if monolithic { "Full" } else { "sliced" }
+                            );
                         }
                         monolithic
                     }

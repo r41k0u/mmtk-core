@@ -132,15 +132,15 @@ pub trait ConcurrentPlan: Plan {
     /// no-op.
     fn request_mature_compaction(&self) {}
 
-    /// `tick_origin` says WHICH pacing site fired: `false` = the post-minor
-    /// path (pause cadence = minors — a big-nursery config's minors are
-    /// promotion-bound and dwarf any quantum, so slicing is pointless there:
-    /// the plan's feasibility gate degrades the cycle to a monolithic Full);
-    /// `true` = the mature-direct allocation tick (pause cadence = tick
-    /// batches — near-empty nursery collections that stay small at ANY
-    /// nursery cap, so the nursery gate must not apply; fragmed flipped from
-    /// cycles to 11 monolithic Fulls, D1 3.4→5.0×, when it did).
-    fn set_mark_quantum_hint_ms(&self, _ms: f64, _debt_ms: f64, _tick_origin: bool) {}
+    /// Record WHICH pacing site fired the cycle being requested: `false` =
+    /// the post-minor path, `true` = the mature-direct allocation tick (pause
+    /// cadence = tick batches — near-empty nursery collections that stay
+    /// small at any nursery cap, so the slicing gate must not degrade such a
+    /// cycle to a monolithic Full; fragmed flipped from cycles to 11 Fulls,
+    /// D1 3.4→5.0×, when it did). Slice sizing itself is the plan's: it
+    /// paces from the runway frozen at InitialMark and its measured mark
+    /// rate, so the binding passes no quantum or debt estimate.
+    fn set_cycle_tick_origin(&self, _tick_origin: bool) {}
 
     /// Did the pause that JUST ENDED start a marking cycle (`InitialMark`, or
     /// a full STW GC — which is a whole cycle in one pause)? For
