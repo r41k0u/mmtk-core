@@ -434,6 +434,18 @@ impl<VM: VMBinding> MarkSweepSpace<VM> {
     }
 
     pub fn release(&mut self) {
+        // Arm the release handshake at most once per GC. MarkCompact resets
+        // the common spaces between its two transitive closures by calling
+        // the plan-level release() and prepare() again from UpdateReferences,
+        // so with `marksweep_as_nonmoving` this runs twice in one GC. The
+        // ReleaseMarkSweepSpace packet queued by the first call runs at the
+        // Release stage either way; a second arm would queue a second packet,
+        // one more decrement than the counter expects: it wraps to usize::MAX
+        // (end_of_gc's assertion) or recycle_blocks runs while a
+        // ReleaseMutator still holds the abandoned lists (try_lock panic).
+        if self.pending_release_packets.load(Ordering::SeqCst) != 0 {
+            return;
+        }
         let num_mutators = VM::VMActivePlan::number_of_mutators();
         // all ReleaseMutator work packets plus the ReleaseMarkSweepSpace packet
         self.pending_release_packets
