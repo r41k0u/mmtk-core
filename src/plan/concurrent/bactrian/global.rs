@@ -879,9 +879,13 @@ impl<VM: VMBinding> GenerationalPlan for Bactrian<VM> {
     /// The binding's mature-pressure pacing and `Gc.major_collections` accounting key
     /// on this — a completed concurrent cycle counts as a major collection, exactly
     /// as in stock OCaml.
+    ///
+    /// The GC trigger's `on_gc_end` asks this BEFORE `end_of_gc` rolls
+    /// `current_pause` into `previous_pause`; the binding asks after. The
+    /// current pause, while still latched, is the one that just ran.
     fn last_collection_full_heap(&self) -> bool {
         matches!(
-            self.previous_pause(),
+            self.current_pause().or(self.previous_pause()),
             Some(Pause::Full) | Some(Pause::FinalMark)
         )
     }
