@@ -1,8 +1,6 @@
 use super::barrier::LXRFieldBarrierSemantics;
 use super::LXR;
 use crate::plan::barriers::FieldBarrier;
-use crate::plan::mutator_context::common_prepare_func;
-use crate::plan::mutator_context::common_release_func;
 use crate::plan::mutator_context::create_allocator_mapping;
 use crate::plan::mutator_context::create_space_mapping;
 use crate::plan::mutator_context::Mutator;
@@ -19,7 +17,7 @@ use enum_map::EnumMap;
 
 // P3.5: cloned from plan/immix/mutator.rs (Immix -> LXR). One Immix allocator at
 // AllocationSemantics::Default; the LXR field barrier is installed in a later P3 step.
-pub fn lxr_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, tls: VMWorkerThread) {
+pub fn lxr_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, _tls: VMWorkerThread) {
     let immix_allocator = unsafe {
         mutator
             .allocators
@@ -29,7 +27,19 @@ pub fn lxr_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, tls: VMWork
     .unwrap();
     immix_allocator.reset();
 
-    common_release_func(mutator, tls);
+    // The plan-level release passes full_heap = false, so a mark-sweep
+    // nonmoving space never arms its release handshake. Releasing its
+    // allocator here would decrement pending_release_packets once per
+    // mutator per pause and wrap it at the first GC.
+    #[cfg(not(feature = "marksweep_as_nonmoving"))]
+    crate::plan::mutator_context::common_release_func(mutator, _tls);
+}
+
+/// Pairs with the plan-level prepare, which also passes full_heap = false:
+/// the mark-sweep nonmoving space is not prepared, so neither is its allocator.
+pub fn lxr_mutator_prepare<VM: VMBinding>(_mutator: &mut Mutator<VM>, _tls: VMWorkerThread) {
+    #[cfg(not(feature = "marksweep_as_nonmoving"))]
+    crate::plan::mutator_context::common_prepare_func(_mutator, _tls);
 }
 
 pub(in crate::plan) const RESERVED_ALLOCATORS: ReservedAllocators = ReservedAllocators {
@@ -57,7 +67,7 @@ pub fn create_lxr_mutator<VM: VMBinding>(
             vec.push((AllocatorSelector::Immix(0), &lxr.immix_space));
             vec
         }),
-        prepare_func: &common_prepare_func,
+        prepare_func: &lxr_mutator_prepare,
         release_func: &lxr_mutator_release,
     };
 
