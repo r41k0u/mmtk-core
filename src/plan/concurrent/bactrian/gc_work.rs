@@ -89,6 +89,31 @@ pub(in crate::plan) struct BactrianNurseryProcessEdges<VM: VMBinding> {
     mark_seed: Vec<ObjectReference>,
 }
 
+fn env_flag(cell: &'static std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| std::env::var(name).as_deref() == Ok("1"))
+}
+/// MMTK_LOCAL_NURSERY_TRACE=1: multi-worker local closure (shared knob with GenImmix).
+fn local_nursery_trace_enabled() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&C, "MMTK_LOCAL_NURSERY_TRACE")
+}
+/// MMTK_UP_DRAIN_REUSE=1: reuse the UP drain's frontier buffer across waves.
+fn up_drain_reuse_enabled() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&C, "MMTK_UP_DRAIN_REUSE")
+}
+/// MMTK_LOCAL_NURSERY_SPILL (default 64, as GenImmix after d0846bd060).
+fn local_nursery_spill() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        std::env::var("MMTK_LOCAL_NURSERY_SPILL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64)
+            .max(2)
+    })
+}
+
 /// Slot visitor that just collects slots into a scratch buffer, for the UP
 /// direct-trace drain below.
 struct SlotCollector<'a, S: Slot>(&'a mut Vec<S>);
@@ -529,12 +554,27 @@ impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
         // asserted away. The OCaml binding answers true for every object (trait
         // default), so for it this vector stays empty.
         let mut fallback: Vec<ObjectReference> = Vec::new();
+        // pop_nodes() is mem::take: it hands back the queue's Vec and leaves a
+        // zero-capacity one, so every wave regrows from scratch (malloc churn on
+        // promotion-heavy closures). With MMTK_UP_DRAIN_REUSE=1 we swap the
+        // queue's buffer with a reusable one instead, as GenImmix's local closure
+        // does, so after warm-up the two vectors keep their capacity.
+        let reuse = up_drain_reuse_enabled();
+        let mut current: Vec<ObjectReference> = Vec::new();
         loop {
-            let nodes = self.pop_nodes();
-            if nodes.is_empty() {
-                break;
+            if reuse {
+                if self.base.nodes.is_empty() {
+                    break;
+                }
+                current.clear();
+                self.base.nodes.swap(&mut current);
+            } else {
+                current = self.pop_nodes();
+                if current.is_empty() {
+                    break;
+                }
             }
-            for object in nodes {
+            for object in current.iter().copied() {
                 if !<VM as VMBinding>::VMScanning::support_slot_enqueuing(tls, object) {
                     fallback.push(object);
                     continue;
@@ -557,6 +597,52 @@ impl<VM: VMBinding> BactrianNurseryProcessEdges<VM> {
             // whose own flush drains locally again, so closure completeness is
             // unchanged; only these objects skip the local work list.
             self.start_or_dispatch_scan_work(self.create_scan_work(fallback));
+        }
+    }
+
+    /// Multi-worker local nursery closure (MMTK_LOCAL_NURSERY_TRACE=1): the
+    /// GenImmix local closure (GenNurseryProcessEdges::flush) for Bactrian, used
+    /// when UP is not armed. Scans newly traced objects inline, wave by wave,
+    /// instead of publishing a ScanObjects packet per wave; spills half of a
+    /// frontier above MMTK_LOCAL_NURSERY_SPILL (default 64) as a stealable packet,
+    /// and sends objects of unknown or large slot width to ordinary packets.
+    /// Per object it runs the packet path's protocol (scan_object ->
+    /// post_scan_object -> process_slot -> trace_object), so the InitialMark seed
+    /// and FinalMark remark in trace_object behave exactly as on the packet path.
+    fn drain_closure_locally_spilling(&mut self) {
+        use crate::vm::Scanning;
+        let threshold = local_nursery_spill();
+        let tls = self.worker().tls;
+        let mut scratch: Vec<SlotOf<Self>> = Vec::new();
+        let mut current: Vec<ObjectReference> = Vec::new();
+        while !self.base.nodes.is_empty() {
+            current.clear();
+            self.base.nodes.swap(&mut current);
+            if current.len() > threshold {
+                let spill = current.split_off(current.len() / 2);
+                let w = self.create_scan_work(spill);
+                self.base.mmtk().scheduler.work_buckets[self.bucket].add(w);
+            }
+            for object in current.iter().copied() {
+                if !<VM as VMBinding>::VMScanning::support_slot_enqueuing(tls, object)
+                    || !matches!(
+                        <VM as VMBinding>::VMScanning::scan_object_slot_upper_bound(tls, object),
+                        Some(bound) if bound <= threshold
+                    )
+                {
+                    self.start_or_dispatch_scan_work(self.create_scan_work(vec![object]));
+                    continue;
+                }
+                scratch.clear();
+                {
+                    let mut collector = SlotCollector(&mut scratch);
+                    <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut collector);
+                }
+                self.plan.post_scan_object(object);
+                for i in 0..scratch.len() {
+                    self.process_slot(scratch[i]);
+                }
+            }
         }
     }
 
@@ -705,8 +791,14 @@ impl<VM: VMBinding> ProcessEdgesWork for BactrianNurseryProcessEdges<VM> {
         // Single tracer: finish the whole closure here (see drain_closure_locally).
         // Gated off when live-bytes stats are requested — the packet path is the
         // one that accounts them.
-        if crate::util::up_trace::up() && !*self.base.mmtk().get_options().count_live_bytes_in_gc {
+        let count_live = *self.base.mmtk().get_options().count_live_bytes_in_gc;
+        if crate::util::up_trace::up() && !count_live {
             self.drain_closure_locally();
+        } else if local_nursery_trace_enabled()
+            && !count_live
+            && !cfg!(feature = "extreme_assertions")
+        {
+            self.drain_closure_locally_spilling();
         }
         self.flush_mark_seed();
         // Default flush behaviour: hand accumulated nodes to a scan-objects packet.

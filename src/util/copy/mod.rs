@@ -140,8 +140,15 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
 
     /// Prepare the copying allocators.
     pub fn prepare(&mut self, mmtk: &MMTK<VM>) {
-        self.omit_promotion_unlog =
-            *mmtk.get_options().plan == crate::util::options::PlanSelector::GenImmix
+        // Bactrian's generational half is also region-only for the OCaml binding
+        // (memory_region_copy_post never reads the log bit; the object barrier
+        // paths that do are never called), and its defrag copies happen only at
+        // Full pauses, where is_current_gc_nursery() is false.
+        let plan_ok = matches!(
+            *mmtk.get_options().plan,
+            crate::util::options::PlanSelector::GenImmix | crate::util::options::PlanSelector::Bactrian
+        );
+        self.omit_promotion_unlog = plan_ok
                 && mmtk
                     .get_plan()
                     .generational()
