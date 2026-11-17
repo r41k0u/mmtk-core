@@ -71,7 +71,21 @@ impl<C: GCWorkContext> GCWork<C::VM> for Prepare<C> {
             mmtk.scheduler.work_buckets[WorkBucketStage::Prepare].bulk_add(prepare_mutator_packets);
         }
 
-        for w in &mmtk.scheduler.worker_group.workers_shared {
+        // Solo mode: only the solo worker traces, so only its copy context needs
+        // preparing. A barred worker's allocators were reset by the
+        // ReleaseCollector of the last pause it took part in, and it runs
+        // PrepareCollector before it next traces.
+        let solo = mmtk.up_solo_ordinal();
+        for (i, w) in mmtk
+            .scheduler
+            .worker_group
+            .workers_shared
+            .iter()
+            .enumerate()
+        {
+            if solo != usize::MAX && i != solo {
+                continue;
+            }
             let result = w.designated_work.push(Box::new(PrepareCollector));
             debug_assert!(result.is_ok());
         }
@@ -149,7 +163,17 @@ impl<C: GCWorkContext + 'static> GCWork<C::VM> for Release<C> {
         );
         mmtk.scheduler.work_buckets[WorkBucketStage::Release].bulk_add(release_mutator_packets);
 
-        for w in &mmtk.scheduler.worker_group.workers_shared {
+        let solo = mmtk.up_solo_ordinal();
+        for (i, w) in mmtk
+            .scheduler
+            .worker_group
+            .workers_shared
+            .iter()
+            .enumerate()
+        {
+            if solo != usize::MAX && i != solo {
+                continue;
+            }
             let result = w.designated_work.push(Box::new(ReleaseCollector));
             debug_assert!(result.is_ok());
         }

@@ -353,12 +353,24 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         }
     }
 
+    /// Solo mode: does any open, enabled bucket still hold packets?
+    fn any_open_bucket_has_work(&self) -> bool {
+        self.work_buckets
+            .values()
+            .any(|b| b.is_enabled() && b.is_open() && !b.is_empty())
+    }
+
     /// Get a schedulable work packet without retry.
     fn poll_schedulable_work_once(&self, worker: &GCWorker<VM>) -> Steal<Box<dyn GCWork<VM>>> {
         let mut should_retry = false;
         // Try find a packet that can be processed only by this worker.
         if let Some(w) = worker.shared.designated_work.pop() {
             return Steal::Success(w);
+        }
+        // Solo mode: only the solo worker takes shared packets.
+        let solo = worker.mmtk.up_solo_ordinal();
+        if solo != usize::MAX && solo != worker.ordinal {
+            return Steal::Empty;
         }
         // Try get a packet from a work bucket.
         for work_bucket in self.work_buckets.values() {
@@ -422,8 +434,10 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             }
 
             let ordinal = worker.ordinal;
+            let solo = worker.mmtk.up_solo_ordinal();
+            let barred = solo != usize::MAX && solo != ordinal;
             self.worker_monitor
-                .park_and_wait(ordinal, |goals| self.on_last_parked(worker, goals))?;
+                .park_and_wait(ordinal, barred, |goals| self.on_last_parked(worker, goals))?;
         }
     }
 
@@ -461,6 +475,16 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
 
                 // We are in the middle of GC, and the last GC worker parked.
                 trace!("The last worker parked during GC.  Try to find more work to do...");
+
+                // Solo mode: a barred worker can be the last to park while open
+                // buckets still hold work for the solo worker (the solo worker was
+                // woken but has not re-taken the monitor lock yet, or a wake-one
+                // went to a barred worker). Wake everyone on the main condvar; the
+                // solo worker is among them, and barred workers park again.
+                let solo = worker.mmtk.up_solo_ordinal();
+                if solo != usize::MAX && solo != worker.ordinal && self.any_open_bucket_has_work() {
+                    return LastParkedResult::WakeAll;
+                }
 
                 // During GC, if all workers parked, all open buckets must have been drained.
                 self.assert_all_open_buckets_are_empty();
@@ -566,6 +590,7 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
                     *gc_start_time = Some(Instant::now());
                 }
 
+                worker.mmtk.choose_solo_at_gc_start(worker.ordinal);
                 self.add_schedule_collection_packet();
                 LastParkedResult::WakeSelf
             }

@@ -35,6 +35,16 @@ pub(crate) struct WorkerMonitor {
     /// -   any work packets available, and
     /// -   any field in `sync.goals.requests` set to true.
     workers_have_anything_to_do: Condvar,
+    /// Solo mode: workers barred from the current solo
+    /// pause wait here, so the pause's broadcasts don't wake them.
+    dormant: Condvar,
+    /// Solo mode is armed. Broadcasts made while it is off also wake the
+    /// dormant workers.
+    solo_active: std::sync::atomic::AtomicBool,
+    /// Workers waiting on `dormant` (changed under `sync`). A futex condvar
+    /// notify is a syscall even with no waiter, so broadcasts skip `dormant`
+    /// when this is zero.
+    dormant_waiters: std::sync::atomic::AtomicUsize,
 }
 
 /// The synchronized part of `WorkerMonitor`.
@@ -92,7 +102,16 @@ impl WorkerMonitor {
                 goals: Default::default(),
             }),
             workers_have_anything_to_do: Default::default(),
+            dormant: Default::default(),
+            solo_active: std::sync::atomic::AtomicBool::new(false),
+            dormant_waiters: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Solo mode on or off (see `MMTK::set_up_trace_solo`).
+    pub fn set_solo_active(&self, active: bool) {
+        self.solo_active
+            .store(active, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Make a request.  Can be called by a mutator to request the workers to work towards the
@@ -110,6 +129,14 @@ impl WorkerMonitor {
     pub fn notify_work_available(&self, all: bool) {
         if all {
             self.workers_have_anything_to_do.notify_all();
+            if !self.solo_active.load(std::sync::atomic::Ordering::SeqCst)
+                && self
+                    .dormant_waiters
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+            {
+                self.dormant.notify_all();
+            }
         } else {
             self.workers_have_anything_to_do.notify_one();
         }
@@ -127,6 +154,7 @@ impl WorkerMonitor {
     pub fn park_and_wait<F>(
         &self,
         ordinal: usize,
+        barred: bool,
         on_last_parked: F,
     ) -> Result<(), WorkerShouldExit>
     where
@@ -218,7 +246,17 @@ impl WorkerMonitor {
             //     and park again if not available.  The last parked worker will ensure the two
             //     conditions listed above are both false before blocking.  If either condition is
             //     true, the last parked worker will take action.
-            sync = self.workers_have_anything_to_do.wait(sync).unwrap();
+            // Solo mode: a barred worker sleeps on `dormant`, which only a
+            // broadcast made outside solo mode wakes.
+            if barred && self.solo_active.load(std::sync::atomic::Ordering::SeqCst) {
+                self.dormant_waiters
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                sync = self.dormant.wait(sync).unwrap();
+                self.dormant_waiters
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                sync = self.workers_have_anything_to_do.wait(sync).unwrap();
+            }
         }
 
         // Unpark this worker.
@@ -274,7 +312,7 @@ mod tests {
                     while !should_unpark.load(Ordering::SeqCst) {
                         println!("Thread {} parking...", ordinal);
                         worker_monitor
-                            .park_and_wait(ordinal, |_goals| {
+                            .park_and_wait(ordinal, false, |_goals| {
                                 println!("Thread {} is the last thread parked.", ordinal);
                                 on_last_parked_called.fetch_add(1, Ordering::SeqCst);
                                 should_unpark.store(true, Ordering::SeqCst);
@@ -314,7 +352,7 @@ mod tests {
                     while !should_unpark.load(Ordering::SeqCst) {
                         println!("Thread {} parking...", ordinal);
                         worker_monitor
-                            .park_and_wait(ordinal, |_goals| {
+                            .park_and_wait(ordinal, false, |_goals| {
                                 println!("Thread {} is the last thread parked.", ordinal);
                                 on_last_parked_called.fetch_add(1, Ordering::SeqCst);
                                 should_unpark.store(true, Ordering::SeqCst);

@@ -49,7 +49,59 @@ pub fn up() -> bool {
 #[inline]
 pub(crate) fn sync_worker<VM: VMBinding>(mmtk: &MMTK<VM>) {
     UP_LOCAL.with(|c| c.set(mmtk.up_trace_enabled()));
+    #[cfg(target_os = "linux")]
+    if SOLO_PINNED.with(|c| c.get())
+        && mmtk.up_solo_ordinal() != crate::scheduler::current_worker_ordinal()
+    {
+        solo_unpin();
+    }
 }
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// Solo mode: this worker's affinity mask before `solo_pin`, if pinned.
+    static SOLO_SAVED: std::cell::RefCell<Option<libc::cpu_set_t>> = const { std::cell::RefCell::new(None) };
+    static SOLO_PINNED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Pin the calling thread to `cpu`, saving its current mask the first time.
+/// Linux only; a no-op elsewhere.
+#[cfg(target_os = "linux")]
+pub(crate) fn solo_pin(cpu: usize) {
+    unsafe {
+        SOLO_SAVED.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.is_none() {
+                let mut old: libc::cpu_set_t = std::mem::zeroed();
+                if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut old) != 0
+                {
+                    return;
+                }
+                *s = Some(old);
+            }
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0 {
+                SOLO_PINNED.with(|c| c.set(true));
+            }
+        });
+    }
+}
+
+/// Restore the mask saved by `solo_pin`.
+#[cfg(target_os = "linux")]
+fn solo_unpin() {
+    SOLO_SAVED.with(|s| {
+        if let Some(old) = s.borrow_mut().take() {
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &old) };
+        }
+    });
+    SOLO_PINNED.with(|c| c.set(false));
+}
+
+/// Thread affinity is only implemented for Linux.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn solo_pin(_cpu: usize) {}
 
 /// Set the calling thread's own view (see `MMTK::set_up_trace`).
 pub(crate) fn set_local(enabled: bool) {

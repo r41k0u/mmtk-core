@@ -126,6 +126,12 @@ pub struct MMTK<VM: VMBinding> {
     /// `util::up_trace`. Read by GC workers into a thread-local before each
     /// work packet.
     pub(crate) up_trace: AtomicBool,
+    /// Solo mode: the ordinal of the one worker allowed to
+    /// run shared work packets while UP is armed with more than one worker,
+    /// or `usize::MAX`. See `MMTK::set_up_trace_solo`.
+    pub(crate) up_solo: std::sync::atomic::AtomicUsize,
+    /// Solo mode: the binding says the next pauses may run solo (few domains).
+    solo_eligible: AtomicBool,
     #[cfg(feature = "sanity")]
     inside_sanity: AtomicBool,
     /// Analysis counters. The feature analysis allows us to periodically stop the world and collect some statistics.
@@ -236,6 +242,8 @@ impl<VM: VMBinding> MMTK<VM> {
             gc_trigger,
             stats,
             up_trace: AtomicBool::new(false),
+            up_solo: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            solo_eligible: AtomicBool::new(false),
         }
     }
 
@@ -478,8 +486,76 @@ impl<VM: VMBinding> MMTK<VM> {
     /// calling thread's own view is updated immediately; other GC workers of
     /// this instance pick the change up before their next work packet.
     pub fn set_up_trace(&self, enabled: bool) {
+        if !enabled {
+            self.up_solo.store(usize::MAX, Ordering::SeqCst);
+            self.scheduler.worker_monitor.set_solo_active(false);
+        }
         self.up_trace.store(enabled, Ordering::SeqCst);
         crate::util::up_trace::set_local(enabled);
+    }
+
+    /// Arm UP mode with more than one worker: the calling GC worker becomes the
+    /// only one that may take shared work packets until `set_up_trace(false)`.
+    /// The other workers still run their designated packets (per-worker copy
+    /// context prepare/release, which touch only that worker's own state) and
+    /// otherwise stay parked, so there is still exactly one tracer. Must be
+    /// called from a GC worker before any tracing packet of the pause is
+    /// available, i.e. from `stop_all_mutators`.
+    ///
+    /// `pin_cpu`: also pin the calling worker to this CPU for the pause (the
+    /// parked mutator's CPU), so the pause runs on a core that is already
+    /// awake. The worker's own mask is restored before its first packet
+    /// outside solo mode.
+    ///
+    /// The solo worker is chosen when the GC starts (`choose_solo_at_gc_start`,
+    /// with every other worker parked), so this only arms UP; it must be called
+    /// on that worker.
+    pub fn set_up_trace_solo(&self, pin_cpu: Option<usize>) {
+        debug_assert_eq!(
+            self.up_solo_ordinal(),
+            crate::scheduler::current_worker_ordinal()
+        );
+        if let Some(cpu) = pin_cpu {
+            crate::util::up_trace::solo_pin(cpu);
+        }
+        self.set_up_trace(true);
+    }
+
+    /// Solo mode: the binding updates this when the domain count changes.
+    pub fn set_solo_eligible(&self, eligible: bool) {
+        self.solo_eligible.store(eligible, Ordering::SeqCst);
+    }
+
+    /// Solo mode: called by the last parked worker (holding the monitor lock,
+    /// every other worker parked) when it starts a GC. If eligible, it becomes the
+    /// only worker that may take shared packets for this GC. Choosing here, and
+    /// not in `stop_all_mutators`, closes the window in which another worker
+    /// passes the solo check just before solo is set and then polls the Prepare
+    /// bucket, which opens while workers run.
+    pub(crate) fn choose_solo_at_gc_start(&self, ordinal: usize) {
+        if self.worker_count() > 1 && self.solo_eligible.load(Ordering::SeqCst) {
+            self.up_solo.store(ordinal, Ordering::SeqCst);
+            self.scheduler.worker_monitor.set_solo_active(true);
+        }
+    }
+
+    /// Is this GC solo (a worker chosen at GC start)?
+    pub fn solo_chosen(&self) -> bool {
+        self.up_solo_ordinal() != usize::MAX
+    }
+
+    /// Solo mode: the pause turned out not to qualify for UP. Let every worker
+    /// take packets again and wake the dormant ones.
+    pub fn cancel_solo(&self) {
+        self.up_solo.store(usize::MAX, Ordering::SeqCst);
+        self.scheduler.worker_monitor.set_solo_active(false);
+        self.scheduler.worker_monitor.notify_work_available(true);
+    }
+
+    /// The solo worker's ordinal, or `usize::MAX` when solo mode is off.
+    #[inline(always)]
+    pub(crate) fn up_solo_ordinal(&self) -> usize {
+        self.up_solo.load(Ordering::SeqCst)
     }
 
     /// Is single-tracer (UP) mode armed for this instance?
