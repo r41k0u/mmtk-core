@@ -258,7 +258,14 @@ impl<VM: VMBinding> GCWorker<VM> {
             // (util::up_trace): the hot paths read a thread-local, never a
             // process-global.
             crate::util::up_trace::sync_worker(mmtk);
-            work.do_work_with_stat(&mut self, mmtk);
+            if crate::mmtk::solo_adapt_mode() == 2 {
+                let t = std::time::Instant::now();
+                work.do_work_with_stat(&mut self, mmtk);
+                mmtk.gc_busy_ns
+                    .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            } else {
+                work.do_work_with_stat(&mut self, mmtk);
+            }
         }
         debug!(
             "Worker exiting. ordinal: {}, {}",

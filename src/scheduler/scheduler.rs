@@ -653,6 +653,7 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             gc_start_time.take().expect("GC not started yet?")
         };
         let elapsed = start_time.elapsed();
+        mmtk.note_solo_pause(elapsed.as_nanos() as u64);
 
         info!(
             "End of GC ({}/{} pages, took {} ms)",

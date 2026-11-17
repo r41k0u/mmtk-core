@@ -132,6 +132,18 @@ pub struct MMTK<VM: VMBinding> {
     pub(crate) up_solo: std::sync::atomic::AtomicUsize,
     /// Solo mode: the binding says the next pauses may run solo (few domains).
     solo_eligible: AtomicBool,
+    /// Adaptive solo (MMTK_SOLO_ADAPT): running means of solo and parallel
+    /// pause times (ns) among eligible pauses, the eligible-pause counter, and
+    /// what the current GC is (0 not eligible, 1 solo, 2 parallel).
+    solo_ewma_ns: std::sync::atomic::AtomicU64,
+    par_ewma_ns: std::sync::atomic::AtomicU64,
+    solo_pauses: std::sync::atomic::AtomicUsize,
+    gc_solo_mode: std::sync::atomic::AtomicU8,
+    /// Adaptive solo: GC-worker busy time (ns, summed over workers) in the
+    /// current GC, and the occupancy (busy / pause wall, x100) measured in the
+    /// last parallel eligible pause; 0 = not measured yet.
+    pub(crate) gc_busy_ns: std::sync::atomic::AtomicU64,
+    par_occ_x100: std::sync::atomic::AtomicU64,
     #[cfg(feature = "sanity")]
     inside_sanity: AtomicBool,
     /// Analysis counters. The feature analysis allows us to periodically stop the world and collect some statistics.
@@ -244,6 +256,12 @@ impl<VM: VMBinding> MMTK<VM> {
             up_trace: AtomicBool::new(false),
             up_solo: std::sync::atomic::AtomicUsize::new(usize::MAX),
             solo_eligible: AtomicBool::new(false),
+            solo_ewma_ns: std::sync::atomic::AtomicU64::new(0),
+            par_ewma_ns: std::sync::atomic::AtomicU64::new(0),
+            solo_pauses: std::sync::atomic::AtomicUsize::new(0),
+            gc_solo_mode: std::sync::atomic::AtomicU8::new(0),
+            gc_busy_ns: std::sync::atomic::AtomicU64::new(0),
+            par_occ_x100: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -533,10 +551,89 @@ impl<VM: VMBinding> MMTK<VM> {
     /// passes the solo check just before solo is set and then polls the Prepare
     /// bucket, which opens while workers run.
     pub(crate) fn choose_solo_at_gc_start(&self, ordinal: usize) {
+        self.gc_solo_mode.store(0, Ordering::Relaxed);
+        self.gc_busy_ns.store(0, Ordering::Relaxed);
         if self.worker_count() > 1 && self.solo_eligible.load(Ordering::SeqCst) {
+            if !self.adaptive_solo_says_solo() {
+                self.gc_solo_mode.store(2, Ordering::Relaxed);
+                return;
+            }
+            self.gc_solo_mode.store(1, Ordering::Relaxed);
             self.up_solo.store(ordinal, Ordering::SeqCst);
             self.scheduler.worker_monitor.set_solo_active(true);
         }
+    }
+
+    /// Adaptive solo: run this eligible pause solo? Always solo without
+    /// MMTK_SOLO_ADAPT. Mode 2 decides by the worker occupancy measured in
+    /// parallel probe pauses. Mode 1 stays solo unless parallel pauses have
+    /// been more than 15 % shorter on average; its probe pauses try the other
+    /// mode, so both means stay current.
+    fn adaptive_solo_says_solo(&self) -> bool {
+        if !solo_adapt_enabled() {
+            return true;
+        }
+        if solo_adapt_mode() == 2 {
+            // Occupancy policy: a parallel probe pause measures how many workers
+            // were busy on average. Narrow heaps (sedlex: about 1) gain nothing
+            // from parallel pauses; wide ones (a big tree) do. Solo while the
+            // last probe's occupancy is below 1.5; probe in parallel at the 2nd
+            // eligible pause and every MMTK_SOLO_PROBE-th after.
+            let n = self.solo_pauses.fetch_add(1, Ordering::Relaxed);
+            static PROBE2: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let every = *PROBE2.get_or_init(|| {
+                std::env::var("MMTK_SOLO_PROBE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(64)
+                    .max(2)
+            });
+            let occ = self.par_occ_x100.load(Ordering::Relaxed);
+            let prefer_solo = occ == 0 || occ < 150;
+            return prefer_solo && !(n == 1 || n % every == every - 1);
+        }
+        let n = self.solo_pauses.fetch_add(1, Ordering::Relaxed);
+        let s = self.solo_ewma_ns.load(Ordering::Relaxed);
+        let p = self.par_ewma_ns.load(Ordering::Relaxed);
+        let prefer_solo = s == 0 || p == 0 || p * 100 >= s * 85;
+        // Probe the other mode once early (the 2nd eligible pause), then every
+        // MMTK_SOLO_PROBE-th (default 64).
+        static PROBE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let every = *PROBE.get_or_init(|| {
+            std::env::var("MMTK_SOLO_PROBE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64)
+                .max(2)
+        });
+        if n == 1 || n % every == every - 1 {
+            !prefer_solo
+        } else {
+            prefer_solo
+        }
+    }
+
+    /// Adaptive solo: fold this GC's pause time into the mean for its mode.
+    pub(crate) fn note_solo_pause(&self, nanos: u64) {
+        if self.gc_solo_mode.load(Ordering::Relaxed) == 2 && nanos > 0 {
+            let busy = self.gc_busy_ns.load(Ordering::Relaxed);
+            self.par_occ_x100
+                .store((busy * 100 / nanos).max(1), Ordering::Relaxed);
+        }
+        let cell = match self.gc_solo_mode.load(Ordering::Relaxed) {
+            1 => &self.solo_ewma_ns,
+            2 => &self.par_ewma_ns,
+            _ => return,
+        };
+        let old = cell.load(Ordering::Relaxed);
+        cell.store(
+            if old == 0 {
+                nanos
+            } else {
+                (old * 7 + nanos) / 8
+            },
+            Ordering::Relaxed,
+        );
     }
 
     /// Is this GC solo (a worker chosen at GC start)?
@@ -547,6 +644,7 @@ impl<VM: VMBinding> MMTK<VM> {
     /// Solo mode: the pause turned out not to qualify for UP. Let every worker
     /// take packets again and wake the dormant ones.
     pub fn cancel_solo(&self) {
+        self.gc_solo_mode.store(0, Ordering::Relaxed);
         self.up_solo.store(usize::MAX, Ordering::SeqCst);
         self.scheduler.worker_monitor.set_solo_active(false);
         self.scheduler.worker_monitor.notify_work_available(true);
@@ -709,4 +807,19 @@ pub fn mmtk_debug_print_object(object: crate::util::ObjectReference) {
     println!("In {}:", sft.name());
     // Print object information
     sft.debug_print_object_info(object);
+}
+
+/// MMTK_SOLO_ADAPT: 1 = compare mean pause times, 2 = measured worker
+/// occupancy in parallel probe pauses. 0 (default) = always solo when eligible.
+pub(crate) fn solo_adapt_mode() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MMTK_SOLO_ADAPT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+pub(crate) fn solo_adapt_enabled() -> bool {
+    solo_adapt_mode() > 0
 }
