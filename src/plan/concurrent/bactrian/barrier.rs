@@ -46,6 +46,10 @@ pub struct BactrianBarrier<VM: VMBinding> {
     satb: VectorQueue<ObjectReference>,
     /// SATB: referents loaded from weak references during marking.
     refs: VectorQueue<ObjectReference>,
+    /// SATB young-referent drops not yet added to `diag::SATB_YOUNG_DROP`.
+    /// Counted here and published at flush: a shared `fetch_add` per barrier
+    /// hit, from every domain, was 17 % of eio_conc_md's cycles.
+    young_drops: usize,
 }
 
 impl<VM: VMBinding> BactrianBarrier<VM> {
@@ -55,6 +59,7 @@ impl<VM: VMBinding> BactrianBarrier<VM> {
             plan: mmtk.get_plan().downcast_ref::<Bactrian<VM>>().unwrap(),
             tls,
             satb_enabled: false,
+            young_drops: 0,
             modbuf: VectorQueue::new(),
             region_modbuf: VectorQueue::new(),
             satb: VectorQueue::default(),
@@ -132,11 +137,9 @@ impl<VM: VMBinding> BactrianBarrier<VM> {
         // skipping them is sound, and it keeps young references out of the marking
         // queues, which must never hold them across a (moving) nursery pause.
         if self.plan.is_object_in_nursery(old) {
-            crate::plan::concurrent::diag::SATB_YOUNG_DROP
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.young_drops += 1;
             return;
         }
-        crate::plan::concurrent::diag::SATB_ENQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.satb.push(old);
         if self.satb.is_full() {
             self.flush_satb();
@@ -157,7 +160,17 @@ impl<VM: VMBinding> BactrianBarrier<VM> {
     }
 
     fn flush_satb(&mut self) {
+        // Publish this buffer's counts once, not per barrier hit. Readers
+        // (the mark quantum's inflow floor, the cycle accounting) run in
+        // pauses, after StopMutators/ScanMutatorRoots flushed every mutator.
+        if self.young_drops > 0 {
+            crate::plan::concurrent::diag::SATB_YOUNG_DROP
+                .fetch_add(self.young_drops, std::sync::atomic::Ordering::Relaxed);
+            self.young_drops = 0;
+        }
         if !self.satb.is_empty() {
+            crate::plan::concurrent::diag::SATB_ENQ
+                .fetch_add(self.satb.len(), std::sync::atomic::Ordering::Relaxed);
             if self.should_create_satb_packets() {
                 let satb = self.satb.take();
                 self.dispatch_satb_packet(ProcessModBufSATB::new(satb));
