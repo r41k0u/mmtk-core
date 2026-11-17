@@ -1547,16 +1547,22 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // store is sound under the single-tracer invariant (same argument as
         // UP-trace); the pause's release lock sequences publish it before
         // any mutator or second worker runs.
-        if crate::util::up_trace::up() {
-            let side = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
+        // Resolve the mark-bit side spec at compile time, so the address and bit
+        // arithmetic in the store folds to constant shifts.
+        let side: SideMetadataSpec = const {
+            *VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+                .as_spec()
+                .extract_side_spec()
+        };
+        if crate::util::up_trace::up() || owned_line_mark_store() {
+            // MMTK_RELAX_PC=1 (opt-in) extends the plain store to
+            // multi-worker pauses. `object` is a fresh copy, so its start lies
+            // in a line held by this worker's copy allocator alone, and a line's
+            // mark bits are whole bytes (256-byte lines, one bit per 8 bytes).
+            // No other thread writes this byte during the pause.
             unsafe { side.store::<u8>(object.to_raw_address(), self.mark_state) };
         } else {
-            VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.store_atomic::<VM, u8>(
-                object,
-                self.mark_state,
-                None,
-                Ordering::SeqCst,
-            );
+            side.store_atomic::<u8>(object.to_raw_address(), self.mark_state, Ordering::SeqCst);
         }
         // Mark the line
         if !super::MARK_LINE_AT_SCAN_TIME {
@@ -1938,4 +1944,10 @@ pub(crate) struct RcRetention {
     pub reserved_pages: usize,
     /// Full pauses only: objects the trace marked whose count is zero (should be 0).
     pub marked_rc0: usize,
+}
+
+/// MMTK_RELAX_PC=1: plain mark-bit store in `post_copy` with several workers.
+fn owned_line_mark_store() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MMTK_RELAX_PC").as_deref() == Ok("1"))
 }

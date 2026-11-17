@@ -32,6 +32,7 @@ impl MetadataSpec {
     }
 
     /// Extract SideMetadataSpec from a MetadataSpec. Panics if this is not side metadata.
+    #[inline(always)]
     pub const fn extract_side_spec(&self) -> &SideMetadataSpec {
         match self {
             MetadataSpec::OnSide(spec) => spec,

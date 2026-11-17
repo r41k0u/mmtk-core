@@ -607,11 +607,21 @@ impl SideMetadataSpec {
                     let lshift = meta_byte_lshift(self, data_addr);
                     let mask = meta_byte_mask(self) << lshift;
                     let metadata_u8 = metadata.to_u8().unwrap();
-                    let _ = unsafe {
-                        <u8 as MetadataValue>::fetch_update(meta_addr, order, order, |v: u8| {
-                            Some((v & !mask) | (metadata_u8 << lshift))
-                        })
-                    };
+                    let bits = metadata_u8 << lshift;
+                    // An all-ones or all-zeros field value is one locked OR / AND
+                    // (the mark bit and the FORWARDED state are both), instead of a
+                    // load plus a compare-exchange retry loop.
+                    if bits == mask {
+                        unsafe { <u8 as MetadataValue>::fetch_or(meta_addr, mask, order) };
+                    } else if bits == 0 {
+                        unsafe { <u8 as MetadataValue>::fetch_and(meta_addr, !mask, order) };
+                    } else {
+                        let _ = unsafe {
+                            <u8 as MetadataValue>::fetch_update(meta_addr, order, order, |v: u8| {
+                                Some((v & !mask) | bits)
+                            })
+                        };
+                    }
                 } else {
                     unsafe {
                         T::store_atomic(meta_addr, metadata, order);
